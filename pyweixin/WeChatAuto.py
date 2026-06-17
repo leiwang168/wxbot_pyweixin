@@ -772,27 +772,47 @@ class Contacts():
         if contact_item.exists(timeout=0.1):
             total_num=int(re.search(r'\d+',contact_item.window_text()).group(0))
             # 滚动间隔：按好友数量分档，防止微信风控检测
+            # 间隔已整体上调，解决面板刷新不及时导致联系人遗漏的问题
             if total_num > 2000:
-                interval = 0.5
+                interval = 0.6
             elif total_num > 1000:
-                interval = 0.35
+                interval = 0.45
             elif total_num > 500:
-                interval = 0.25
+                interval = 0.35
             elif total_num > 200:
-                interval = 0.18
+                interval = 0.28
             else:
-                interval = 0.12
+                interval = 0.20
             contact_item.click_input()
             #有具体的数量,后续可以更换为for循环
             switch_to_first_friend()
             info=get_specific_info()
             friends_detail.append(info)
+            last_nickname = info.get('昵称', '')
+            last_wxid = info.get('微信号', '')
             mouse.move(coords=area)
+            skipped = 0
             for _ in range(total_num-1):
                 time.sleep(interval)
                 pyautogui.press('down', _pause=False)  # 离散按键，比 keyDown 长按更不易被检测
-                info=get_specific_info()
+                # 等待右侧面板刷新：验证昵称或微信号确实变化，防止读到上一个联系人
+                info = get_specific_info()
+                cur_nickname = info.get('昵称', '')
+                cur_wxid = info.get('微信号', '')
+                retry = 0
+                while cur_nickname == last_nickname and cur_wxid == last_wxid and retry < 5:
+                    time.sleep(0.1)
+                    info = get_specific_info()
+                    cur_nickname = info.get('昵称', '')
+                    cur_wxid = info.get('微信号', '')
+                    retry += 1
+                if cur_nickname == last_nickname and cur_wxid == last_wxid:
+                    skipped += 1
                 friends_detail.append(info)
+                last_nickname = cur_nickname
+                last_wxid = cur_wxid
+            if skipped:
+                print(f'[Contacts] 联系人可能存在遗漏: {skipped} 次面板未刷新')
             Tools.collapse_contacts(main_window,contact_list)
         if is_json:
             friends_detail=json.dumps(obj=friends_detail,ensure_ascii=False,indent=2)
@@ -895,19 +915,42 @@ class Contacts():
             print(f'你没有企业微信联系人,无法获取企业微信好友信息！')
         else:
             total_num=int(re.search(r'\d+',wecom_item.window_text()).group(0))
-            if total_num>2000:interval=0.3
-            if 1000<total_num<2000:interval=0.1
-            if total_num<1000:interval=0
+            # 滚动间隔：按好友数量分档，防止微信风控检测（与普通联系人保持一致）
+            if total_num > 2000:
+                interval = 0.6
+            elif total_num > 1000:
+                interval = 0.45
+            elif total_num > 500:
+                interval = 0.35
+            elif total_num > 200:
+                interval = 0.28
+            else:
+                interval = 0.20
             wecom_item.click_input()
             switch_to_first_friend()
             info=get_specific_info()
             friends_detail.append(info)
+            last_nickname = info.get('昵称', '')
             mouse.move(coords=area)
-            for _ in range(total_num+1):
-                if interval:time.sleep(interval)
-                pyautogui.keyDown('Down',_pause=False)
-                info=get_specific_info()
+            skipped = 0
+            for _ in range(total_num-1):
+                time.sleep(interval)
+                pyautogui.press('down', _pause=False)  # 离散按键，比 keyDown 长按更不易被检测
+                # 等待右侧面板刷新：验证昵称确实变化，防止读到上一个联系人
+                info = get_specific_info()
+                cur_nickname = info.get('昵称', '')
+                retry = 0
+                while cur_nickname == last_nickname and retry < 5:
+                    time.sleep(0.1)
+                    info = get_specific_info()
+                    cur_nickname = info.get('昵称', '')
+                    retry += 1
+                if cur_nickname == last_nickname:
+                    skipped += 1
                 friends_detail.append(info)
+                last_nickname = cur_nickname
+            if skipped:
+                print(f'[Contacts] 企业微信联系人可能存在遗漏: {skipped} 次面板未刷新')
             Tools.collapse_contacts(main_window,contact_list)
             if is_json:
                 friends_detail=json.dumps(obj=friends_detail,ensure_ascii=False,indent=2)
@@ -981,19 +1024,46 @@ class Contacts():
             print(f'你没有关注过任何服务号,无法获取服务号信息！')
         else:
             total_num=int(re.search(r'\d+',service_item.window_text()).group(0))
-            if total_num>2000:interval=0.3
-            if 1000<total_num<2000:interval=0.1
-            if total_num<1000:interval=0
+            # 滚动间隔：按好友数量分档，防止微信风控检测（与普通联系人保持一致）
+            if total_num > 2000:
+                interval = 0.6
+            elif total_num > 1000:
+                interval = 0.45
+            elif total_num > 500:
+                interval = 0.35
+            elif total_num > 200:
+                interval = 0.28
+            else:
+                interval = 0.20
             service_item.click_input()
             switch_to_first_friend()
             info=get_specific_info()
             friends_detail.append(info)
+            last_name = info.get('名称', '')
+            last_wxid = info.get('微信号', '')
             mouse.move(coords=area)
-            for _ in range(total_num):
+            skipped = 0
+            for _ in range(total_num-1):
                 time.sleep(interval)
-                pyautogui.keyDown('Down',_pause=False)
-                info=get_specific_info()
+                pyautogui.press('down', _pause=False)  # 离散按键，比 keyDown 长按更不易被检测
+                # 等待右侧面板刷新：验证名称或微信号确实变化，防止读到上一个
+                info = get_specific_info()
+                cur_name = info.get('名称', '')
+                cur_wxid = info.get('微信号', '')
+                retry = 0
+                while cur_name == last_name and cur_wxid == last_wxid and retry < 5:
+                    time.sleep(0.1)
+                    info = get_specific_info()
+                    cur_name = info.get('名称', '')
+                    cur_wxid = info.get('微信号', '')
+                    retry += 1
+                if cur_name == last_name and cur_wxid == last_wxid:
+                    skipped += 1
                 friends_detail.append(info)
+                last_name = cur_name
+                last_wxid = cur_wxid
+            if skipped:
+                print(f'[Contacts] 服务号可能存在遗漏: {skipped} 次面板未刷新')
             Tools.collapse_contacts(main_window,contact_list)
             friends_detail=remove_duplicates(friends_detail)
             if is_json:
@@ -1068,19 +1138,46 @@ class Contacts():
             print(f'你没有关注过任何公众号,无法获取公众号信息！')
         else:
             total_num=int(re.search(r'\d+',official_item.window_text()).group(0))
-            if total_num<1000:interval=0
-            if 1000<total_num<2000:interval=0.1
-            if total_num>2000:interval=0.3
+            # 滚动间隔：按好友数量分档，防止微信风控检测（与普通联系人保持一致）
+            if total_num > 2000:
+                interval = 0.6
+            elif total_num > 1000:
+                interval = 0.45
+            elif total_num > 500:
+                interval = 0.35
+            elif total_num > 200:
+                interval = 0.28
+            else:
+                interval = 0.20
             official_item.click_input()
             switch_to_first_friend()
             info=get_specific_info()
             friends_detail.append(info)
+            last_name = info.get('名称', '')
+            last_wxid = info.get('微信号', '')
             mouse.move(coords=area)
-            for _ in range(total_num):
-                if interval:time.sleep(interval)
-                pyautogui.keyDown('Down',_pause=False)
-                info=get_specific_info()
+            skipped = 0
+            for _ in range(total_num-1):
+                time.sleep(interval)
+                pyautogui.press('down', _pause=False)  # 离散按键，比 keyDown 长按更不易被检测
+                # 等待右侧面板刷新：验证名称或微信号确实变化，防止读到上一个
+                info = get_specific_info()
+                cur_name = info.get('名称', '')
+                cur_wxid = info.get('微信号', '')
+                retry = 0
+                while cur_name == last_name and cur_wxid == last_wxid and retry < 5:
+                    time.sleep(0.1)
+                    info = get_specific_info()
+                    cur_name = info.get('名称', '')
+                    cur_wxid = info.get('微信号', '')
+                    retry += 1
+                if cur_name == last_name and cur_wxid == last_wxid:
+                    skipped += 1
                 friends_detail.append(info)
+                last_name = cur_name
+                last_wxid = cur_wxid
+            if skipped:
+                print(f'[Contacts] 公众号可能存在遗漏: {skipped} 次面板未刷新')
             Tools.collapse_contacts(main_window,contact_list)
             friends_detail=remove_duplicates(friends_detail)
             if is_json:
