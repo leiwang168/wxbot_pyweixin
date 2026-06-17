@@ -18,11 +18,16 @@ MAX_CONTACT_LEN = 128
 MAX_HISTORY_LIMIT = 200
 TASK_TIMEOUT_DEFAULT = 60
 DEDUP_WINDOW = 300
-TASK_PRIORITY_DEFAULT = 5
+TASK_PRIORITY_DEFAULT = 9
 TASK_PRIORITY_MAP = {
-    "ping": 0, "wechat_message": 1, "add_friend": 2,
-    "get_chat_history": 3, "refresh_contacts": 4,
-    "get_friend_details": 5, "post_moments": 6,
+    # 数字越小优先级越高：联系人 > 加好友 > 朋友圈 > 发消息 > 其他
+    "get_friend_details": 0,
+    "refresh_contacts": 1,
+    "add_friend": 2,
+    "post_moments": 3,
+    "wechat_message": 4,
+    "get_chat_history": 5,
+    "ping": 6,
 }
 WINDOW_OPENING_TASKS = {"send_text", "get_chat_history", "get_friend_details"}
 
