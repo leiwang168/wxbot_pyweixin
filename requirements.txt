@@ -1,0 +1,20 @@
+# pyweixin SDK 已内嵌为本项目的本地包（./pyweixin/），无需单独安装。
+# 以下为 pyweixin 的运行时依赖（来自 pywechat/src/requirements.txt）：
+psutil>=5.9.5
+pyautogui>=0.9.54
+pycaw>=20240210
+pywin32>=308
+pywin32-ctypes>=0.2.2
+pywinauto>=0.6.8
+pillow>=10.4.0
+emoji>=2.14.1
+sounddevice>=0.5.1
+soundfile>=0.13.1
+packaging>=23.2
+
+# 本工程自身额外依赖：
+schedule>=1.2.0
+requests>=2.31.0
+# MQTT 数字员工（OpenClaw 通道）：
+paho-mqtt>=1.6.0
+minio>=7.2.0
