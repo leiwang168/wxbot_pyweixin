@@ -299,9 +299,14 @@ class MqttCoordinator:
         emit("INFO", f"回调发布 {'成功' if ok else '失败'} topic={callback_topic} payload={callback_payload}", identity.role)
 
         # add_friend 成功后加入该角色转发联系人并持久化
+        # 仅单 agent 兜底模式（forward_contacts 为空）时不追加，否则会从"转发全部"变成"只转发这一个"
         if task.get("event") == "add_friend" and result.get("status") == "success":
             listen_name = result.get("result", {}).get("listen_name", "")
-            if listen_name and identity.forward_topic and listen_name not in identity.forward_contacts:
+            enabled_count = sum(1 for i in self._identities if i.enabled)
+            is_catchall = not identity.forward_contacts
+            if enabled_count <= 1 and is_catchall:
+                emit("INFO", f"单 agent 兜底模式，跳过追加 forward_contacts: {listen_name}", identity.role)
+            elif listen_name and identity.forward_topic and listen_name not in identity.forward_contacts:
                 identity.forward_contacts.append(listen_name)
                 emit("INFO", f"已将 {listen_name} 加入 {identity.role} 的转发联系人", identity.role)
                 if self._extension:
@@ -313,14 +318,21 @@ class MqttCoordinator:
         # wechat_message 发送成功后记录 operate + 消息指纹（防回环），供后续上行转发时使用
         if task.get("event") == "wechat_message" and result.get("status") == "success":
             target_name = task.get("targetName", "") or task.get("targetId", "") or ""
-            if target_name and self._extension:
-                if task.get("operate"):
-                    self._extension._session_operate[target_name] = task["operate"]
-                    emit("INFO", f"已记录会话 operate: {target_name} -> {task['operate']}", identity.role)
-                sent_text = task.get("text", "")
-                if sent_text:
-                    self._extension._last_sent[target_name] = (sent_text, time.time())
-                    emit("INFO", f"已记录发送指纹: {target_name} -> {sent_text[:40]}", identity.role)
+            if self._extension:
+                operate_val = task.get("operate", "")
+                if operate_val:
+                    if target_name:
+                        self._extension._session_operate[target_name] = operate_val
+                        emit("INFO", f"已记录会话 operate: {target_name} -> {operate_val}", identity.role)
+                    else:
+                        # targetName 为空 → 全局 operate，对所有联系人生效
+                        self._extension._session_operate["__global__"] = operate_val
+                        emit("INFO", f"已记录全局 operate: __global__ -> {operate_val}", identity.role)
+                if target_name:
+                    sent_text = task.get("text", "")
+                    if sent_text:
+                        self._extension._last_sent[target_name] = (sent_text, time.time())
+                        emit("INFO", f"已记录发送指纹: {target_name} -> {sent_text[:40]}", identity.role)
 
     def get_status(self) -> dict:
         with self._lock:

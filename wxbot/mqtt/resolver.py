@@ -50,6 +50,13 @@ class ContactResolver:
         self._loaded_at = 0.0
         self._last_refresh = 0.0
         self._load_from_file()
+        # 缓存文件不存在或为空 → 启动后自动全量拉取一次
+        if not self._friends:
+            emit("INFO", "联系人缓存为空，启动后自动刷新（超时120s）...")
+            try:
+                self.refresh_cache(timeout=120)
+            except Exception as e:
+                emit("ERROR", f"启动时联系人缓存自动刷新失败: {e}")
 
     # ---- 公开 API ----
     def resolve(self, target: str) -> ResolveResult:
@@ -102,7 +109,7 @@ class ContactResolver:
                 self._resolve_retried = False
         return ResolveResult(success=False, error=f"未找到匹配联系人: {key}")
 
-    def refresh_cache(self, timeout: int = 60) -> dict:
+    def refresh_cache(self, timeout: int = 120) -> dict:
         # 限速：防止频繁全量拉取（UI 操作），两次刷新间隔至少 _REFRESH_COOLDOWN 秒
         now = time.time()
         with self._lock:

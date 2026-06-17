@@ -105,9 +105,21 @@ def read_chat_messages(main_window, number: int = 5) -> list[tuple[str, str, str
         return []
     items = chat_list.children(control_type="ListItem")
     out = []
-    for item in items[-number:]:
+    i = len(items) - number
+    while i < len(items):
+        if i < 0:
+            i += 1
+            continue
+        item = items[i]
         display, mtype, mpath = classify_message(item)
+        # 语音消息：检查下一条是否为转文字内容
+        if mtype == "语音" and i + 1 < len(items):
+            next_display, next_mtype, _ = classify_message(items[i + 1])
+            if next_mtype == "文本" and next_display:
+                display = f"{display} | 转文字: {next_display}"
+                i += 1  # 跳过下一条（已合并）
         out.append((display, mtype, mpath))
+        i += 1
     return out
 
 
@@ -118,6 +130,14 @@ def _process_one(main_window, chat: str, sender: str, text: str,
                  msg_type: str, current_friend: Optional[str],
                  processed: set[str], file_path: str | None = None) -> None:
     if msg_type == "系统消息":
+        # 好友通过验证消息 → 主动触发新好友回调
+        if any(kw in text for kw in ("已通过", "现在可以开始聊天", "已添加", "accepted")):
+            log.info(f"[新好友回调] 检测到好友通过: {text[:80]}")
+            try:
+                from .friends import check_and_pass_once
+                check_and_pass_once()
+            except Exception as e:
+                log.error(f"[新好友回调] 异常: {e}")
         return
     if msg_type in ("被拉黑", "被删除"):
         log.warning(f"⚠️ {chat} 可能{msg_type}: {text!r}")
@@ -141,8 +161,11 @@ def _process_one(main_window, chat: str, sender: str, text: str,
 
     log.info(f"[收到] {chat}({sender}) [{msg_type}]: {text!r}")
 
-    # MQTT 数字员工：转发到上游 OpenClaw。优先于白名单执行——
-    # 对齐 SiverWXbot_plus：所有好友消息无条件转发给远端 AI，白名单仅控制本地回复。
+    # 监听过滤：白名单/黑名单同时控制本地回复和 MQTT 转发
+    if not is_listened_chat(chat, is_group):
+        return
+
+    # MQTT 数字员工：转发到上游 OpenClaw
     forwarded = False
     if mqtt_worker.enabled:
         try:
@@ -152,10 +175,6 @@ def _process_one(main_window, chat: str, sender: str, text: str,
     # 转发成功且配置跳过本地回复 → 仅执行自定义转发后返回
     if forwarded and bot_config.get("mqtt_worker", {}).get("skip_local_reply_when_forwarded", True):
         _do_custom_forward(main_window, chat, sender, text, is_group, current_friend)
-        return
-
-    # 监听过滤：仅控制本地 AI 回复（MQTT 转发已在上面无条件完成）
-    if not is_listened_chat(chat, is_group):
         return
 
     # 决定回复
@@ -200,6 +219,11 @@ class Monitor:
         self._stop.set()
 
     def run_once(self) -> None:
+        # MQTT 任务执行中（发送消息等），跳过本轮避免 UI 冲突
+        if mqtt_worker.wx_busy:
+            log.info("MQTT 任务执行中，跳过本轮消息轮询")
+            return
+
         main_window = Navigator.open_weixin(is_maximize=False)
         main_window.child_window(**SideBar.Weixin).click_input()
         time.sleep(0.3)

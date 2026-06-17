@@ -22,11 +22,12 @@ _CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 DEFAULTS: dict[str, Any] = {
     # 通用 / 监听
     "admin": "文件传输助手",
-    "AllListen_switch": False,        # False=白名单模式, True=黑名单(全局)模式
+    "AllListen_switch": False,        # False=白名单模式, True=全局监听模式
     "AllListen_filter_mute": True,    # 全局监听下过滤免打扰会话
+    "black_list": [],                 # 全局监听黑名单（私聊+群聊均生效）
     "chat_listen_only": False,        # 私聊只监听不 AI 回复
-    "listen_list": [],                # 白名单/黑名单用户
-    "group": [],                      # 监听群聊
+    "listen_list": [],                # 白名单用户（AllListen_switch=False 时生效）
+    "group": [],                      # 监听群聊（白名单模式，AllListen_switch=False 时生效）
     "group_switch": False,            # 群聊监听总开关
     "group_listen_only": False,
     "group_reply_at_msg": True,       # 群回复是否 @ 发言人

@@ -291,7 +291,7 @@ class MqttWorkerExtension:
             callback_prefix = ident.resolve_callback_prefix()
             msg_id = f"wechat-{uuid.uuid4().hex[:8]}"
             publish_topic = f"{forward_topic}/{msg_id}" if callback_prefix and forward_topic == callback_prefix else forward_topic
-            session_operate = self._session_operate.get(chat, "auto")
+            session_operate = self._session_operate.get(chat) or self._session_operate.get("__global__", "auto")
             payload = {
                 "event": "wechat_message", "correlationId": msg_id,
                 "senderId": sender_wxid, "senderName": chat,

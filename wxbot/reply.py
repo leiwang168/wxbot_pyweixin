@@ -52,16 +52,22 @@ def human_delay() -> None:
 # 监听判定
 # ---------------------------------------------------------------------------
 def is_listened_chat(chat: str, is_group: bool) -> bool:
-    """该会话是否在监听范围内。"""
+    """该会话是否在监听范围内。
+
+    AllListen_switch=False → 白名单模式：listen_list / group 是允许列表
+    AllListen_switch=True  → 全局监听模式：监听所有，black_list 中的除外
+    """
     if is_group:
         if not bot_config.get("group_switch", False):
             return False
         if bot_config.get("AllListen_switch", False):
-            return True
+            # 全局监听：black_list 中的群聊被排除
+            return chat not in bot_config.get("black_list", [])
         return chat in bot_config.get("group", [])
     # 私聊
     if bot_config.get("AllListen_switch", False):
-        return True
+        # 全局监听：black_list 中的私聊被排除
+        return chat not in bot_config.get("black_list", [])
     return chat in bot_config.get("listen_list", [])
 
 
