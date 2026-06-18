@@ -204,13 +204,32 @@ class TaskExecutor:
 
         chat_only = permission == "仅聊天"
         try:
-            FriendSettings.add_new_friend(number=target, greetings=verify_text or None,
+            nickname = FriendSettings.add_new_friend(number=target, greetings=verify_text or None,
                                           remark=remark or None, chat_only=chat_only, close_weixin=False)
         except Exception as e:
             return {"status": "error", "error": f"添加好友失败: {e}"}
-        self._log("INFO", f"好友请求已发送: {target}")
+        self._log("INFO", f"好友请求已发送: {target} (昵称: {nickname})")
         if tags or permission == "朋友圈":
             self._log("WARNING", "pyweixin 暂不支持 tags/朋友圈权限，已跳过（已知 gap）")
+
+        # 直接追加到联系人缓存，避免全量刷新通讯录
+        contact_info = {
+            "昵称": nickname,
+            "微信号": target,
+            "地区": "",
+            "备注": remark if remark else "",
+            "电话": "",
+            "标签": "",
+            "描述": "",
+            "朋友权限": permission,
+            "共同群聊": "",
+            "个性签名": "",
+            "来源": "",
+        }
+        try:
+            self.resolver.add_contact(contact_info)
+        except Exception as e:
+            self._log("WARNING", f"追加联系人到缓存失败: {e}")
 
         listen_name = remark or target
         try:

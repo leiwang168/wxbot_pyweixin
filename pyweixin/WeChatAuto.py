@@ -1561,6 +1561,9 @@ class FriendSettings():
             add_friend_pane.close()
             if close_weixin:main_window.close()
             raise ValueError(f'{number} 已经是你的好友,无需重复添加')
+        # 抓取对方昵称（contact_profile_view 第一个 Text 控件）
+        texts=contact_profile_view.descendants(control_type='Text')
+        nickname=texts[0].window_text() if texts else number
         add_to_contact.click_input()
         verify_friend_window=Tools.move_window_to_center(Window=Windows.VerifyFriendWindow)
         request_content_edit=verify_friend_window.child_window(control_type='Edit',found_index=0)
@@ -1577,6 +1580,7 @@ class FriendSettings():
         add_friend_pane.close()
         if close_weixin:
             main_window.close()
+        return nickname
 
     @staticmethod
     def mute_notification(friend:str,mute:int=0,fold_chat:int=0,search_pages:int=None,is_maximize:bool=None,close_weixin:bool=None):

@@ -16,6 +16,7 @@ import threading
 import time
 
 from .config import bot_config
+from .mqtt.resolver import ContactResolver
 
 
 def _emit(msg: str) -> None:
@@ -42,9 +43,9 @@ class _FriendAddAdapter:
             if remark:
                 kwargs["remark"] = remark
             _emit(f"Adapter: 准备调用 FriendSettings.add_new_friend(number={target})")
-            FriendSettings.add_new_friend(**kwargs)
-            _emit("Adapter: add_new_friend 返回成功")
-            return {"status": "sent", "raw": None}
+            nickname = FriendSettings.add_new_friend(**kwargs)
+            _emit(f"Adapter: add_new_friend 返回成功, 昵称={nickname}")
+            return {"status": "sent", "raw": None, "nickname": nickname}
         except Exception as e:
             _emit(f"Adapter: add_new_friend 异常: {type(e).__name__}: {e}")
             return {"status": "failed", "raw": str(e)}
@@ -116,7 +117,9 @@ class _FriendAddService:
                     self._today_count += 1
                 self._log("SUCCESS", f"[好友添加] 申请已发送: target={target}")
                 return {"status": "sent", "reason": "ok", "target": target,
-                        "source": source, "ts": time.time()}
+                        "source": source, "ts": time.time(),
+                        "nickname": result.get("nickname", target),
+                        "remark": remark}
 
             last_result = result
             self._log("WARNING",
@@ -160,6 +163,13 @@ class FriendAddExtension:
     def __init__(self) -> None:
         self._service: _FriendAddService | None = None
         self._initialized = False
+        self._resolver: ContactResolver | None = None
+
+    @property
+    def _contact_resolver(self) -> ContactResolver:
+        if self._resolver is None:
+            self._resolver = ContactResolver(log_func=None)
+        return self._resolver
 
     def initialize(self) -> None:
         cfg = bot_config.get("friend_add", {}) or {}
@@ -203,6 +213,26 @@ class FriendAddExtension:
 
         status = result["status"]
         if status == "sent":
+            # 直接追加到联系人缓存，避免全量刷新通讯录
+            nickname = result.get("nickname", target)
+            remark = result.get("remark", "")
+            contact_info = {
+                "昵称": nickname,
+                "微信号": target,
+                "地区": "",
+                "备注": remark,
+                "电话": "",
+                "标签": "",
+                "描述": "",
+                "朋友权限": "",
+                "共同群聊": "",
+                "个性签名": "",
+                "来源": "",
+            }
+            try:
+                self._contact_resolver.add_contact(contact_info)
+            except Exception as e:
+                _emit(f"追加联系人到缓存失败: {e}")
             return f"好友申请已发送给 {target}"
         if status == "rejected":
             return f"无法添加 {target}：{result['reason']}"

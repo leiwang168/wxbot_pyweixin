@@ -171,6 +171,26 @@ class ContactResolver:
             age = time.time() - self._loaded_at if self._loaded_at else -1
         return {"size": size, "age_seconds": round(age, 1), "cache_file": self._cache_path}
 
+    def add_contact(self, info: dict) -> bool:
+        """追加单个联系人到缓存并持久化，避免全量刷新。
+
+        线程安全。wxid 已存在则跳过；wxid 缺失则返回 False。
+        """
+        norm = self._normalize(info)
+        wxid = self._get_wxid(norm)
+        if not wxid:
+            emit("WARNING", "add_contact: info dict 中未找到微信号，跳过")
+            return False
+        wl = wxid.lower()
+        with self._lock:
+            if wl in self._wxid_map:
+                return False
+            self._friends.append(norm)
+            self._wxid_map[wl] = norm
+            self._save_to_file()
+        emit("INFO", f"联系人缓存已追加: wxid={wxid} (共 {len(self._friends)} 人)")
+        return True
+
     # ---- 内部 ----
     def _load_from_file(self) -> None:
         if not os.path.exists(self._cache_path):
