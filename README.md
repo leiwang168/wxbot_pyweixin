@@ -1,10 +1,11 @@
 # wxbot_pyweixin
 
-基于 [pyweixin](https://github.com/Hello-Mr-Crab/pywechat) SDK（`pywinauto` UI 自动化）的可配置微信机器人，复刻 [SiverWXbot_plus](https://github.com/SiverKing/SiverWXbot_plus) 的核心配置能力，**不依赖付费的 `wxautox4`**。
+基于 [pyweixin](https://github.com/Hello-Mr-Crab/pywechat) SDK（`pywinauto` UI 自动化）的可配置微信机器人，复刻 [SiverWXbot_plus](https://github.com/SiverKing/SiverWXbot_plus) 的核心配置能力，**不依赖付费的 `wxautox4`**。 
 
-> `pyweixin` SDK 已作为本地包内嵌在 `./pyweixin/`（源自 `pywechat/src/pyweixin`），无需单独安装。
 
 ## 功能概览
+
+## 配合openclaw agent 一起使用，可以让龙虾帮你远程操作wx机器人，支持一对多模式，一个龙虾，多个wx机器人客户端，通过MQTT通讯。
 
 ### 阶段一（三大优先功能最小闭环）
 - ✅ **收发消息** — 全局/白名单监听、关键词回复、自定义转发、只监听模式、随机延时、超长分段
@@ -30,7 +31,7 @@
 ## 环境要求
 
 - Windows 10/11 64-bit
-- 微信 4.1.x（已登录）
+- 微信 4.1.9.35（已验证）
 - 讲述人 trick 已处理（UI 树可见，见 `pywechat/Weixin4.0.md`）
 - Python 3.10+
 
@@ -129,6 +130,7 @@ wxbot_pyweixin/
 ├── config/config.json   # 首次运行自动生成
 ├── memory/<wxid>/...    # 对话记忆（运行时生成）
 ├── logs/                # 运行日志
+├── openclaw/            # openclaw agent 示例
 ├── requirements.txt
 └── wxbot/
     ├── config.py        # BotConfig 配置管理
@@ -164,3 +166,11 @@ wxbot_pyweixin/
 3. **朋友圈**：`/立即发朋友圈 你好|C:\x.jpg` → 发布；配一条 1 分钟后 `scheduled_moments_list` → 定时发布；`moments_like_switch=true` → 随机点赞。
 4. **记忆**：发几条消息后 `/记忆列表` → 查看条数；`/清空记忆 窗口名`。
 5. **随机定时**：配一条 `time_start/time_end` 跨当前时刻的 `random_msg_list` → 到随机时刻自动发送。
+
+
+##  特别鸣谢 
+1、 [pyweixin](https://github.com/Hello-Mr-Crab/pywechat)
+2、 [SiverWXbot_plus](https://github.com/SiverKing/SiverWXbot_plus)
+
+## 特别注意
+👎👎请勿将wxbot_pyweixin用于任何非法商业活动，因此造成的一切后果由使用者自行承担！
