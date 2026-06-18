@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 logs/
 .venv/
+config/config.json
+config/config.json.bak
+config/contacts_cache.json
+config/config - 副本.json
