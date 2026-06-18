@@ -1,0 +1,9 @@
+# MinIO 文件存储配置
+# 用于上传询价单文件等供微信联系人下载
+
+endpoint: https://minio.xxx.cn
+access-key: minio
+secret-key: xxxxxx
+bucket-name: wxbot
+region: us-east-1
+secure: true

@@ -1,0 +1,32 @@
+# MQTT 配置 — zhuolang
+broker: "127.0.0.1"
+port: 1883
+username: "mqtt_client"
+password: "mqtt_123456"
+
+connect_timeout: 20
+ping_timeout: 10
+message_timeout: 20
+
+reconnect_min: 3
+reconnect_max: 60
+
+agent:
+  name: "zhuolang"
+  outbound_topic: "agent/zhuolang"
+
+app:
+  in_topic: "app/zhuolang/in"
+  out_topic: "app/zhuolang/out"
+
+instances:
+  - id: "wx_001"
+    topic_prefix: "wechat/zhuolang/wx_001"
+    # 该实例专属下行任务 topic；Wbot 侧需将 subscribe_topic 配成此值
+    # 省略时回退到全局 agent.outbound_topic（向后兼容旧部署）
+    outbound_topic: "agent/zhuolang/wx_001"
+    enabled: true
+  - id: "wx_002"
+    topic_prefix: "wechat/zhuolang/wx_002"
+    outbound_topic: "agent/zhuolang/wx_002"
+    enabled: false
