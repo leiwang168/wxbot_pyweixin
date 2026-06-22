@@ -2574,7 +2574,7 @@ class Moments():
        
 
     @staticmethod
-    def dump_recent_posts(recent:Literal['Today','Yesterday','Week','Month']='Today',number:int=None,with_name:bool=False,save_detail:bool=False,target_folder:str=None,is_maximize:bool=None,close_weixin:bool=None)->list[dict]:
+    def dump_recent_posts(recent:Literal['Today','Yesterday','Week','Month']='Today',number:int=None,with_name:bool=False,save_detail:bool=False,target_folder:str=None,is_maximize:bool=None,close_weixin:bool=None,dedupe:bool=False)->list[dict]:
         '''
         该方法用来获取最近一月内微信朋友圈内好友发布过的具体内容
         Args:
@@ -2592,7 +2592,7 @@ class Moments():
             post_history=[dic for dic in posts if dic.get('好友')==friend]
             post_count=len(post_history)#用来保存同一个好友的多条朋友圈时,内部文件夹按照1,2,3...
             friend=re.sub(illegal_chars, '', friend)#windows路径不能有非法字符！
-            detail_folder=os.path.join(target_folder,friend,str(post_count))
+            detail_folder=os.path.join(target_folder,friend,datetime.now().strftime('%Y-%m-%d'),str(post_count))
             os.makedirs(detail_folder,exist_ok=True)
             content_path=os.path.join(detail_folder,'内容.txt')
             capture_path=os.path.join(detail_folder,'内容截图.png')
@@ -2618,20 +2618,8 @@ class Moments():
                 time.sleep(2)#缓存到剪贴板
                 SystemSettings.save_pasted_video(video_path)
                 pyautogui.press('esc')
-            #保存图片
-            if photo_num:
-                mouse.click(coords=PostImagePos)
-                pyautogui.press('left',presses=photo_num,interval=0.15)
-                rect=moments_window.rectangle()
-                right_click_pos=rect.mid_point().x+120,rect.mid_point().y-20
-                for i in range(photo_num):
-                    mouse.right_click(coords=right_click_pos)
-                    moments_window.child_window(**MenuItems.CopyMenuItem).click_input()
-                    path=os.path.join(detail_folder,f'{i}.png')
-                    time.sleep(0.5)#0.5s缓存到剪贴板时间
-                    SystemSettings.save_pasted_image(path)
-                    pyautogui.press('right',interval=0.05)
-                pyautogui.press('esc')
+            # 图片单张保存已跳过:朋友圈广场缩略图右键无"复制",且密集右键会触发 COM 错;
+            # 整条内容已由上方"内容截图.png"捕获,如需单图改用大图预览方式(待适配)
 
         def parse_post(content_listitem:ListItemWrapper):
             '''获取朋友圈文本中的时间戳,图片数量,以及剩余内容'''
@@ -2691,15 +2679,54 @@ class Moments():
         yesterday=Special_Labels.Yesterday
         days_ago=Special_Labels.DaysAgo
         time.sleep(2)#等待一下朋友圈自动刷新,不然获取的可能是过去的内容
+        # dedupe:加载已保存指纹,跳过重复条目(每天跑不重复保存)
+        seen=set()
+        _dedup_path=None
+        if dedupe:
+            _dedup_dir=target_folder or os.path.join(os.getcwd(),'dump_recents_posts朋友圈内容保存')
+            os.makedirs(_dedup_dir,exist_ok=True)
+            _dedup_path=os.path.join(_dedup_dir,'dedup.json')
+            try:
+                with open(_dedup_path,'r',encoding='utf-8') as f:
+                    seen=set(json.load(f))
+            except Exception:
+                seen=set()
+            print(f'[Moments] 去重已启用,已记录 {len(seen)} 条历史指纹')
         if moments_list.children(control_type='ListItem'):
+            _com_fails=0
             while True:
-                listitems=[listitem for listitem in moments_list.children(control_type='ListItem') if listitem.class_name() not in not_contents]
-                selected=[listitem for listitem in listitems if listitem.has_keyboard_focus()]
+                try:
+                    listitems=[listitem for listitem in moments_list.children(control_type='ListItem') if listitem.class_name() not in not_contents]
+                    selected=[listitem for listitem in listitems if listitem.has_keyboard_focus()]
+                except Exception:
+                    _com_fails+=1
+                    if _com_fails>3:
+                        print('[Moments] UI COM 错误连续多次,终止获取')
+                        break
+                    time.sleep(0.5)
+                    continue
+                _com_fails=0
                 if selected:
                     friend,content,photo_num,video_num,post_time=parse_post(selected[0])
+                    # dedupe:命中已保存指纹则翻页跳过(不append不save)
+                    if dedupe:
+                        _content=(content or '').strip()
+                        # 有文字用文本去重(稳定);纯图/视频无文字用图视数+相对时间兜底(防误删不同条)
+                        _fp=f"{friend}|{_content[:100]}" if _content else f"{friend}|图{photo_num}视{video_num}|{post_time}"
+                        if _fp in seen:
+                            try:
+                                moments_list.type_keys('{DOWN}',pause=0.1)
+                            except Exception:
+                                pass
+                            continue
+                        seen.add(_fp)
                     post_detail={'好友':friend,'内容':content,'图片数量':photo_num,'视频数量':video_num,'发布时间':post_time}
                     posts.append(post_detail)
-                    if save_detail:save_media(selected[0],friend,content,photo_num,video_num)
+                    if save_detail:
+                        try:
+                            save_media(selected[0],friend,content,photo_num,video_num)
+                        except Exception as e:
+                            print(f'[Moments] 保存媒体失败,跳过该条媒体: {e}')
                     recorded_num+=1
                     if isinstance(number,int) and recorded_num>=number:
                         break
@@ -2711,7 +2738,15 @@ class Moments():
                         break
                     if recent=='Month' and post_time not in month_days:#当前的朋友圈内容发布时间不在一个月的时间内
                         break
-                moments_list.type_keys('{DOWN}',pause=0.1)
+                try:
+                    moments_list.type_keys('{DOWN}',pause=0.1)
+                except Exception:
+                    _com_fails+=1
+                    if _com_fails>3:
+                        print('[Moments] UI COM 错误连续多次,终止获取')
+                        break
+                    time.sleep(0.5)
+                    continue
             if recent=='Today':
                 posts=[post for post in posts if  yesterday not in post.get('发布时间')]
             if recent=='Yesterday':
@@ -2720,7 +2755,16 @@ class Moments():
                 posts=[post for post in posts if post.get('发布时间') in week_days]
             if recent=='Month':
                 posts=[post for post in posts if post.get('发布时间') in month_days]
-        moments_window.close()
+        if dedupe and _dedup_path:
+            try:
+                with open(_dedup_path,'w',encoding='utf-8') as f:
+                    json.dump(list(seen),f,ensure_ascii=False)
+            except Exception:
+                pass
+        try:
+            moments_window.close()
+        except Exception:
+            pass  # 关闭失败不影响已获取的内容返回
         return posts
     
     @staticmethod
@@ -2841,7 +2885,10 @@ class Moments():
             posts=[post for post in posts if post.get('发布时间') in week_days]
         if recent=='Month':
             posts=[post for post in posts if post.get('发布时间') in month_days]
-        moments_window.close()
+        try:
+            moments_window.close()
+        except Exception:
+            pass  # 关闭失败不影响已获取的内容返回
         return posts
 
     @staticmethod
@@ -3036,9 +3083,20 @@ class Moments():
         moments_list.type_keys('{HOME}')
         contents=[listitem for listitem in moments_list.children(control_type='ListItem') if listitem.class_name() not in not_contents]
         if contents:
+            _com_fails=0
             while True:
-                moments_list.type_keys('{DOWN}')
-                selected=[listitem for listitem in moments_list.children(control_type='ListItem') if listitem.has_keyboard_focus()]
+                try:
+                    moments_list.type_keys('{DOWN}')
+                    selected=[listitem for listitem in moments_list.children(control_type='ListItem') if listitem.has_keyboard_focus()]
+                except Exception:
+                    # pywinauto UIA 偶发 COM 错(事件无法调用订户),重试即可恢复
+                    _com_fails+=1
+                    if _com_fails>3:
+                        print('[Moments] UI COM 错误连续多次,终止获取')
+                        break
+                    time.sleep(0.5)
+                    continue
+                _com_fails=0
                 if selected and selected[0].class_name() not in not_contents:
                     selected[0].click_input()
                     if not sns_detail_list.exists(timeout=0.1):#如果导出的是自己朋友圈内容，第一个项目其实是发表朋友圈,点击后弹出的是windows filechoose，直接关闭
@@ -3064,7 +3122,10 @@ class Moments():
                             backbutton.click_input()
                         if Tools.is_sns_at_bottom(moments_list,selected[0]):
                             break     
-        moments_window.close()
+        try:
+            moments_window.close()
+        except Exception:
+            pass  # 关闭失败不影响已获取的内容返回
         return posts
 
     @staticmethod
@@ -3165,7 +3226,10 @@ class Moments():
                         break
                 if liked_num>=number:
                     break
-        moments_window.close()
+        try:
+            moments_window.close()
+        except Exception:
+            pass  # 关闭失败不影响已获取的内容返回
         return posts
 
 

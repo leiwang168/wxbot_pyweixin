@@ -70,6 +70,12 @@ DEFAULTS: dict[str, Any] = {
     "moments_like_max": 120,
     "random_moments_switch": False,
     "random_moments_list": [],
+    # 朋友圈导出(每日定时获取保存)
+    "moments_export_switch": True,     # 每日朋友圈导出开关
+    "moments_export": {
+        "target_folder": r"E:\Desktop\朋友圈内容导出",  # 导出根目录(其下按 好友/日期/序号 结构)
+        "number": None,                # None=取当天全部(只按 recent='Today' 过滤);填正整数则作条数上限
+    },
     # 每日启停
     "everyday_start_stop_bot_switch": False,
     "everyday_start_bot_time": "08:00",

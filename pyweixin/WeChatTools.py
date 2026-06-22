@@ -921,15 +921,27 @@ class Navigator():
         if search_pages is None:
             search_pages=GlobalConfig.search_pages
         chatinfo_pane,main_window=Navigator.open_chatinfo(friend=friend,is_maximize=is_maximize,search_pages=search_pages)
-        friend_button=chatinfo_pane.child_window(title=friend,control_type='Button')
         old_version=version.parse(GlobalConfig.Version)<version.parse('4.1.9')#比4.1.9版本低
+        # 4.1.9+ 用 automation_id 精确定位好友头像(ChatMemberCell),避免坐标偏移点到旁边的"添加"按钮
+        if old_version:
+            friend_button=chatinfo_pane.child_window(title=friend,control_type='Button')
+        else:
+            friend_button=main_window.child_window(auto_id='single_chat_member_cell',control_type='Button')
         if friend_button.exists(timeout=3):
-            click_pos=MousePos(friend_button).FriendProfilePos
-            mouse.click(coords=click_pos)
             if not old_version:
                 profile_pane=desktop.window(**Windows.PopUpProfileWindow)
             else:
                 profile_pane=main_window.window(**Windows.PopUpProfileWindow)
+            # 点头像弹资料卡(4.1.9.35 弹卡不稳定):点完等资料卡出现,没弹就重点,最多3次
+            for _ in range(3):
+                if old_version:
+                    click_pos=MousePos(friend_button).FriendProfilePos
+                    mouse.click(coords=click_pos)
+                else:
+                    friend_button.click_input()
+                if profile_pane.exists(timeout=1.5):
+                    break
+                time.sleep(0.3)
             return profile_pane,main_window
         else:
             chatinfo_button=main_window.child_window(**Buttons.ChatInfoButton)
