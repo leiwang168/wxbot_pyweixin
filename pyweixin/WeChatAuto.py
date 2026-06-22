@@ -60,6 +60,7 @@ import json
 import pyautogui
 import win32clipboard
 import win32gui,win32con
+from datetime import datetime,timedelta
 from typing import Literal
 from warnings import warn
 from pywinauto import WindowSpecification
@@ -2844,7 +2845,78 @@ class Moments():
         return posts
 
     @staticmethod
-    def dump_friend_posts(friend:str,number:int,save_detail:bool=False,target_folder:str=None,search_pages:int=None,is_maximize:bool=None,close_weixin:bool=None)->list[dict]:
+    def _parse_post_time(post_time:str)->datetime:
+        '''将好友朋友圈详情页时间戳解析为 datetime。
+
+        支持格式(中/英/繁):
+          2024年5月3日 14:30 / 2024-5-3 14:30   (完整年月日时分)
+          5月3日 14:30                          (月日时分,默认今年,跨年回退去年)
+          昨天 14:30 / Yesterday 14:30          (昨天)
+          星期一 14:30 / Monday 14:30           (本周对应星期)
+          14:30                                 (今天)
+        无法解析时返回 datetime.min(视为最早,不会被 until 截断)。
+        '''
+        now=datetime.now()
+        try:
+            s=post_time.strip()
+            # 1) 完整年月日 2024年5月3日 14:30 / 2024-5-3 14:30
+            m=re.match(r'(\d{4})[年\-](\d{1,2})[月\-](\d{1,2})日?\s+(\d{1,2}):(\d{2})',s)
+            if m:
+                return datetime(int(m[1]),int(m[2]),int(m[3]),int(m[4]),int(m[5]))
+            # 2) 月日时分 5月3日 14:30(默认今年,未来日期回退去年)
+            m=re.match(r'(\d{1,2})月(\d{1,2})日?\s+(\d{1,2}):(\d{2})',s)
+            if m:
+                dt=datetime(now.year,int(m[1]),int(m[2]),int(m[3]),int(m[4]))
+                if dt>now:
+                    dt=dt.replace(year=now.year-1)
+                return dt
+            # 3) 昨天 Yesterday
+            if '昨天' in s or 'Yesterday' in s:
+                m=re.search(r'(\d{1,2}):(\d{2})',s)
+                if m:
+                    y=now-timedelta(days=1)
+                    return datetime(y.year,y.month,y.day,int(m[1]),int(m[2]))
+            # 4) 星期X Weekday(本周)
+            m=re.match(r'(星期\w|星期日|星期天|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s+(\d{1,2}):(\d{2})',s)
+            if m:
+                weekday_map={'星期一':0,'星期二':1,'星期三':2,'星期四':3,'星期五':4,'星期六':5,'星期日':6,'星期天':6,
+                    'Monday':0,'Tuesday':1,'Wednesday':2,'Thursday':3,'Friday':4,'Saturday':5,'Sunday':6}
+                wd=weekday_map.get(m[1])
+                if wd is not None:
+                    delta=now.weekday()-wd
+                    if delta<0:
+                        delta+=7
+                    d=now-timedelta(days=delta)
+                    return datetime(d.year,d.month,d.day,int(m[2]),int(m[3]))
+            # 5) 仅时分 14:30(今天)
+            m=re.match(r'(\d{1,2}):(\d{2})',s)
+            if m:
+                return datetime(now.year,now.month,now.day,int(m[1]),int(m[2]))
+        except Exception:
+            pass
+        return datetime.min
+
+    @staticmethod
+    def _parse_until(until)->datetime:
+        '''解析截止时间,接受 datetime 或字符串(如 "2024-6-1"、"2024-6-1 12:00"、"2024年6月1日")。'''
+        if isinstance(until,datetime):
+            return until
+        if not until:
+            return datetime.min
+        s=str(until).strip()
+        for fmt in ('%Y-%m-%d %H:%M','%Y-%m-%d %H:%M:%S','%Y-%m-%d','%Y年%m月%d日 %H:%M','%Y年%m月%d日'):
+            try:
+                return datetime.strptime(s,fmt)
+            except ValueError:
+                continue
+        # 兜底:尝试从字符串里抽数字
+        m=re.match(r'(\d{4})[年\-](\d{1,2})[月\-](\d{1,2})',s)
+        if m:
+            return datetime(int(m[1]),int(m[2]),int(m[3]))
+        raise ValueError(f'无法解析截止时间: {until}，支持格式如 "2024-6-1" 或 "2024-6-1 12:00"')
+
+    @staticmethod
+    def dump_friend_posts(friend:str,number:int,save_detail:bool=False,target_folder:str=None,search_pages:int=None,is_maximize:bool=None,close_weixin:bool=None,until=None)->list[dict]:
         '''
         该方法用来获取某个好友的微信朋友圈的内一定数量的内容
         Args:
@@ -2855,6 +2927,9 @@ class Moments():
             search_pages:在会话列表中查找好友时滚动列表的次数,默认为5,一次可查询5-12人,为0时,直接从顶部搜索栏搜索好友信息打开聊天界面
             is_maximize:微信界面是否全屏，默认不全屏
             close_weixin:任务结束后是否关闭微信，默认关闭
+            until:截止时间,只获取发布时间晚于等于 until 的内容(遇到更早的即停止)。
+                   可传 datetime 或字符串(如 "2024-6-1"、"2024-6-1 12:00"、"2024年6月1日")。
+                   None 表示不限制,只受 number 控制。
         Returns:
             posts:朋友圈具体内容,list[dict]的格式,具体为[{'内容':xx,'图片数量':xx,'视频数量':xx,'发布时间':xx}]
         '''
@@ -2945,6 +3020,9 @@ class Moments():
             os.makedirs(friend_folder,exist_ok=True)
         posts=[]
         recorded_num=0
+        until_dt=Moments._parse_until(until) if until is not None else None#截止时间,朋友圈按时间倒序遍历,遇到早于 until 的即停止
+        if until_dt is not None:
+            print(f'[Moments] 按好友 {friend} 获取朋友圈,截止时间: {until_dt}')
         sns_detail_pattern=Regex_Patterns.Snsdetail_Timestamp_pattern#朋友圈好友发布内容左下角的时间戳pattern
         contain_image_pattern=Regex_Patterns.Contain_Images_pattern#朋友圈包含1~9张图片
         not_contents=['mmui::AlbumBaseCell','mmui::AlbumTopCell']#置顶内容不需要
@@ -2968,6 +3046,12 @@ class Moments():
                     else:
                         listitem=sns_detail_list.children(control_type='ListItem')[0]
                         content,photo_num,video_num,post_time=parse_friend_post(listitem)
+                        # 截止时间判断:朋友圈按时间倒序,遇到早于 until 的即停止(当前条不收)
+                        if until_dt is not None:
+                            post_dt=Moments._parse_post_time(post_time)
+                            if post_dt!=datetime.min and post_dt<until_dt:
+                                print(f'[Moments] 遇到早于截止时间的内容({post_time} < {until_dt}),停止获取')
+                                break
                         posts.append({'内容':content,'图片数量':photo_num,'视频数量':video_num,'发布时间':post_time})
                         if save_detail:
                             detail_folder=os.path.join(friend_folder,f'{recorded_num}')
