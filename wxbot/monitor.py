@@ -126,6 +126,26 @@ def read_chat_messages(main_window, number: int = 5) -> list[tuple[str, str, str
 # ---------------------------------------------------------------------------
 # 单条消息处理
 # ---------------------------------------------------------------------------
+def _clear_pending_if_match(name: str) -> None:
+    """若 name 匹配某个待通过好友,移除其标记。
+
+    对方主动发来消息(带红点,被 ② 处理)时调用,避免 ③ 再重复模拟"已通过好友请求"。
+    匹配用双向子串(pending 的 match 是备注/昵称,name 是会话标识/显示名)。
+    """
+    if not name:
+        return
+    try:
+        from .pending_friends import load_pending, remove_pending
+        for p in load_pending():
+            m = p.get("match", "")
+            if m and (m == name or m in name or name in m):
+                remove_pending(m)
+                log.info(f"[新好友通过] {m} 主动发来消息,跳过模拟通知")
+                break
+    except Exception:
+        pass
+
+
 def _process_one(main_window, chat: str, sender: str, text: str,
                  msg_type: str, current_friend: Optional[str],
                  processed: set[str], file_path: str | None = None) -> None:
@@ -160,6 +180,9 @@ def _process_one(main_window, chat: str, sender: str, text: str,
     processed.add(msg_id)
 
     log.info(f"[收到] {chat}({sender}) [{msg_type}]: {text!r}")
+
+    # 若是待通过好友主动发来消息,清除其标记(避免 ③ 重复模拟"已通过好友请求")
+    _clear_pending_if_match(chat)
 
     # 监听过滤：白名单/黑名单同时控制本地回复和 MQTT 转发
     if not is_listened_chat(chat, is_group):
@@ -214,6 +237,7 @@ class Monitor:
         self.current_friend: Optional[str] = None
         self.current_last_rid = None
         self._first_run = True
+        self._last_pending_scan = 0.0  # 待通过好友扫描节流时间戳
 
     def stop(self) -> None:
         self._stop.set()
@@ -305,6 +329,72 @@ class Monitor:
                 chat_items = chat_list.children(control_type="ListItem")
                 self.current_friend = friend
                 self.current_last_rid = chat_items[-1].element_info.runtime_id if chat_items else None
+
+        # ③ 待通过好友主动检测(不依赖红点,主动遍历会话列表;有 pending 才执行)
+        self._check_pending_friends(main_window)
+
+    def _check_pending_friends(self, main_window) -> None:
+        """主动遍历会话列表,发现待通过好友出现则模拟'已通过好友请求'转发 MQTT。
+
+        节流(默认60s)+ 只读 window_text 不点击,避免和 ①② 抢 UI/改变停留会话。
+        冲突保障:开头HOME、结束HOME、全程不 click_input 会话条目。
+        """
+        from .pending_friends import load_pending, remove_pending
+        pending = load_pending()
+        if not pending:
+            return
+        # 节流
+        interval = float(bot_config.get("monitor_pending_interval", 60) or 60)
+        now = time.time()
+        if now - self._last_pending_scan < interval:
+            return
+        self._last_pending_scan = now
+        matches = [p.get("match") for p in pending if p.get("match")]
+        if not matches:
+            return
+        hit: set[str] = set()
+        try:
+            session_list = main_window.child_window(**Main_window.SessionList)
+            if not session_list.exists(timeout=0.5):
+                return
+            session_list.type_keys("{HOME}")
+            time.sleep(0.2)
+            prev_last = None
+            for _ in range(60):  # max_pages
+                try:
+                    items = session_list.children(control_type="ListItem")
+                except Exception:
+                    break
+                for item in items:
+                    try:
+                        wt = item.window_text() or ""
+                    except Exception:
+                        continue
+                    for m in matches:
+                        if m not in hit and m in wt:
+                            hit.add(m)
+                if len(hit) >= len(matches):  # 全部命中,提前结束
+                    break
+                cur_last = items[-1].window_text() if items else ""
+                if cur_last == prev_last:  # 到底
+                    break
+                prev_last = cur_last
+                session_list.type_keys("{PGDN}")
+                time.sleep(0.15)
+            session_list.type_keys("{HOME}")  # 复位
+        except Exception as e:
+            log.error(f"待通过好友扫描异常: {e}")
+        # 命中的逐个模拟转发(遍历结束后统一处理,不并发)
+        for m in hit:
+            try:
+                mqtt_worker.on_wechat_message(
+                    chat=m, sender=m,
+                    content="我已通过您的好友请求，现在可以聊天了",
+                    msg_type="文本")
+                remove_pending(m)
+                log.info(f"[新好友通过] {m} 出现在会话列表,已模拟通知并转发 MQTT")
+            except Exception as e:
+                log.error(f"[新好友通过] 模拟转发 {m} 失败: {e}")
 
     def loop(self) -> None:
         self.check_interval = float(bot_config.get("monitor_check_interval", 10) or 10)

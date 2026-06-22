@@ -233,6 +233,12 @@ class FriendAddExtension:
                 self._contact_resolver.add_contact(contact_info)
             except Exception as e:
                 _emit(f"追加联系人到缓存失败: {e}")
+            # 标记为"待通过":monitor 扫到该好友出现在会话列表时模拟"已通过好友请求"转发 MQTT
+            try:
+                from .pending_friends import add_pending
+                add_pending(remark or nickname)
+            except Exception as e:
+                _emit(f"写入待通过标记失败: {e}")
             return f"好友申请已发送给 {target}"
         if status == "rejected":
             return f"无法添加 {target}：{result['reason']}"

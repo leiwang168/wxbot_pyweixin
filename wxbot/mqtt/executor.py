@@ -272,6 +272,13 @@ class TaskExecutor:
                 self._log("WARNING", f"加入监听列表失败: {e}")
         threading.Thread(target=_bg_listen, daemon=True, name=f"listen-{listen_name[:8]}").start()
 
+        # 标记为"待通过":monitor 扫到该好友出现在会话列表时模拟"已通过好友请求"转发 MQTT
+        try:
+            from ..pending_friends import add_pending
+            add_pending(remark or nickname)
+        except Exception as e:
+            self._log("WARNING", f"写入待通过标记失败: {e}")
+
         return {"status": "success", "action": "add_friend_sent",
                 "target": target, "listen_name": listen_name}
 
