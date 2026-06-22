@@ -45,6 +45,7 @@ class ContactResolver:
         self._log = log_func or emit
         self._cache_path = cache_path or _CACHE_PATH
         self._lock = threading.Lock()
+        self._save_lock = threading.Lock()  # 串行化文件写入,防止并发 os.replace 竞态
         self._friends: list[dict] = []
         self._wxid_map: dict[str, dict] = {}
         self._loaded_at = 0.0
@@ -201,6 +202,12 @@ class ContactResolver:
 
     # ---- 内部 ----
     def _load_from_file(self) -> None:
+        """从缓存文件加载,采用 merge 语义(不覆盖内存中已有条目)。
+
+        关键:内存里 add_contact 追加但尚未写盘的条目优先保留,
+        仅追加文件里有而内存没有的条目。防止 resolve 重试触发的
+        reload 覆盖掉刚追加、还没落盘的联系人。
+        """
         if not os.path.exists(self._cache_path):
             return
         try:
@@ -212,38 +219,43 @@ class ContactResolver:
         friends_raw = data.get("friends", [])
         if not isinstance(friends_raw, list):
             return
-        friends, wxid_map = [], {}
-        seen_wxid: set[str] = set()
-        for item in friends_raw:
-            if not isinstance(item, dict):
-                continue
-            norm = self._normalize(item)
-            w = self._get_wxid(norm)
-            if w:
-                wl = w.lower()
-                if wl in seen_wxid:
-                    continue
-                seen_wxid.add(wl)
-                wxid_map[wl] = norm
-            friends.append(norm)
         with self._lock:
-            self._friends = friends
-            self._wxid_map = wxid_map
+            # merge:内存现有条目优先(可能比文件新),再追加文件独有条目
+            merged_friends = list(self._friends)
+            merged_map = dict(self._wxid_map)
+            existing = set(merged_map.keys())  # 已有 wxid (小写)
+            file_only = 0
+            for item in friends_raw:
+                if not isinstance(item, dict):
+                    continue
+                norm = self._normalize(item)
+                w = self._get_wxid(norm)
+                if w:
+                    wl = w.lower()
+                    if wl in existing:
+                        continue  # 内存已有,保留内存版本
+                    existing.add(wl)
+                    merged_map[wl] = norm
+                    file_only += 1
+                merged_friends.append(norm)
+            self._friends = merged_friends
+            self._wxid_map = merged_map
             self._loaded_at = data.get("updated_at", time.time())
-        emit("INFO", f"从本地联系人缓存加载: {len(friends)} 人")
+        emit("INFO", f"从本地联系人缓存合并加载: 新增 {file_only} 条, 共 {len(merged_friends)} 人")
 
     def _save_to_file(self) -> bool:
         with self._lock:
             data = {"updated_at": time.time(), "count": len(self._friends),
                     "friends": list(self._friends)}
-        try:
-            os.makedirs(os.path.dirname(self._cache_path), exist_ok=True)
-            with open(self._cache_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            return True
-        except Exception as e:
-            emit("ERROR", f"写入联系人缓存失败: {e}")
-            return False
+        with self._save_lock:  # 串行化:避免多个后台线程并发写同一文件导致半截 JSON
+            try:
+                os.makedirs(os.path.dirname(self._cache_path), exist_ok=True)
+                with open(self._cache_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                return True
+            except Exception as e:
+                emit("ERROR", f"写入联系人缓存失败: {e}")
+                return False
 
     @staticmethod
     def _normalize(raw: dict) -> dict:

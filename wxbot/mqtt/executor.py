@@ -64,8 +64,8 @@ class TaskExecutor:
             mw = Navigator.open_weixin(is_maximize=False)
             mw.child_window(**SideBar.Weixin).click_input()
             time.sleep(0.15)
-        except Exception:
-            pass
+        except Exception as e:
+            self._log("WARNING", f"UI 窗口重置失败，后续操作可能受影响: {e}")
         if self._wx_busy_event:
             self._wx_busy_event.set()
 
