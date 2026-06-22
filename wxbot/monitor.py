@@ -219,11 +219,21 @@ class Monitor:
         self._stop.set()
 
     def run_once(self) -> None:
-        # MQTT 任务执行中（发送消息等），跳过本轮避免 UI 冲突
-        if mqtt_worker.wx_busy:
-            log.info("MQTT 任务执行中，跳过本轮消息轮询")
+        # 获取 UI 互斥锁：与 MQTT 任务/异步媒体线程互斥，避免抢鼠标
+        ui_lock = mqtt_worker.ui_lock
+        if ui_lock and not ui_lock.acquire(timeout=0.5):
+            log.info("UI 锁被占用，跳过本轮消息轮询")
             return
+        try:
+            self._run_once_locked()
+        finally:
+            if ui_lock:
+                try:
+                    ui_lock.release()
+                except RuntimeError:
+                    pass
 
+    def _run_once_locked(self) -> None:
         main_window = Navigator.open_weixin(is_maximize=False)
         main_window.child_window(**SideBar.Weixin).click_input()
         time.sleep(0.3)

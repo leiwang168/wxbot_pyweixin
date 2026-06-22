@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -117,7 +118,7 @@ class MqttWorkerExtension:
                      self._identities[0] if self._identities else None)
         agent_base = first.agent_id if first else "wbot"
         self._adapter = MqttAdapter(cfg, agent_base)
-        self._executor = TaskExecutor(log_func=emit)
+        self._executor = TaskExecutor(log_func=emit, resolver=self.resolver)
         self._coordinator = MqttCoordinator(cfg, self._adapter, self._executor, self._identities, extension=self)
         self._adapter.set_handlers(on_connect=lambda rc: self._on_connect(rc),
                                    on_disconnect=lambda rc: None,
@@ -145,6 +146,28 @@ class MqttWorkerExtension:
     @property
     def wx_busy(self) -> bool:
         return self._coordinator.wx_busy if self._coordinator else False
+
+    @property
+    def ui_lock(self):
+        """UI 互斥锁，monitor 和 MQTT 任务共享。"""
+        return self._coordinator._ui_lock if self._coordinator else None
+
+    def _enter_ui(self) -> None:
+        """获取 UI 锁，标记进入 UI 操作（供异步媒体线程等使用）。"""
+        if self._coordinator:
+            if not self._coordinator._ui_lock.acquire(timeout=30):
+                emit("WARNING", "UI 锁获取超时 (30s)，媒体保存跳过")
+                raise RuntimeError("UI lock acquire timeout")
+            self._coordinator._wx_busy_event.set()
+
+    def _exit_ui(self) -> None:
+        """释放 UI 锁，标记退出 UI 操作。"""
+        if self._coordinator:
+            self._coordinator._wx_busy_event.clear()
+            try:
+                self._coordinator._ui_lock.release()
+            except RuntimeError:
+                pass
 
     def reconfigure(self) -> None:
         self._refresh_wx_account_info()
@@ -177,7 +200,7 @@ class MqttWorkerExtension:
                      self._identities[0] if self._identities else None)
         agent_base = first.agent_id if first else "wbot"
         self._adapter = MqttAdapter(cfg, agent_base)
-        self._executor = TaskExecutor(log_func=emit)
+        self._executor = TaskExecutor(log_func=emit, resolver=self.resolver)
         self._coordinator = MqttCoordinator(cfg, self._adapter, self._executor, self._identities, extension=self)
         self._adapter.set_handlers(on_connect=lambda rc: self._on_connect(rc),
                                    on_disconnect=lambda rc: None,
@@ -220,14 +243,8 @@ class MqttWorkerExtension:
                     display_text = f"[{msg_type}]"
             elif msg_type in ("图片", "视频"):
                 display_text = f"[{msg_type}]"
-                # save_media 保存最新一张 → 上传 MinIO
-                try:
-                    result = self._save_latest_media(chat, msg_type)
-                    if result:
-                        file_name, file_size, file_url = result
-                        display_text = f"[{msg_type}] {file_name}"
-                except Exception as e:
-                    emit("WARNING", f"保存媒体失败: {e}")
+                # 异步保存+上传：避免同步 UI 操作阻塞 monitor 线程导致后续消息丢失
+                self._launch_async_media_followup(chat, sender, msg_type)
             else:
                 display_text = f"[{msg_type}]"
 
@@ -410,6 +427,77 @@ class MqttWorkerExtension:
             s = ident.get_status()
             lines.append(f"[{s['role']}] {'启用' if s['enabled'] else '禁用'} subscribe={s['subscribe_topic']}")
         return "\n".join(lines)
+
+    def _launch_async_media_followup(self, chat: str, sender: str, msg_type: str) -> None:
+        """后台线程：保存最新媒体 → 上传 MinIO → 补发带 fileUrl 的 MQTT 消息。"""
+        def _run():
+            try:
+                self._enter_ui()
+                try:
+                    result = self._save_latest_media(chat, msg_type)
+                finally:
+                    self._exit_ui()
+                if not result:
+                    return
+                file_name, file_size, file_url = result
+
+                # 补发：格式与主转发一致，附带 fileUrl
+                msg_id = f"wechat-{uuid.uuid4().hex[:8]}"
+                sender_wxid = sender
+                chat_wxid = chat
+                if self.resolver.cache_ready:
+                    try:
+                        resolved = self.resolver.resolve(sender)
+                        if resolved.success and resolved.wxid:
+                            sender_wxid = resolved.wxid
+                    except Exception:
+                        pass
+                    if chat != sender:
+                        try:
+                            resolved = self.resolver.resolve(chat)
+                            if resolved.success and resolved.wxid:
+                                chat_wxid = resolved.wxid
+                        except Exception:
+                            pass
+                    else:
+                        chat_wxid = sender_wxid
+
+                display_text = f"[{msg_type}] {file_name}"
+                has_specific = any(i.enabled and i.forward_contacts and chat in i.forward_contacts
+                                   for i in self._identities)
+                for ident in self._identities:
+                    if not ident.enabled:
+                        continue
+                    forward_topic = ident.resolve_forward_topic()
+                    if not forward_topic:
+                        continue
+                    if ident.forward_contacts:
+                        if chat not in ident.forward_contacts:
+                            continue
+                    elif has_specific:
+                        continue
+                    publish_topic = forward_topic
+                    session_operate = self._session_operate.get(chat)
+                    if not session_operate or session_operate == "auto":
+                        session_operate = self._session_operate.get("__global__", "auto")
+                    payload = {
+                        "event": "wechat_message", "correlationId": msg_id,
+                        "senderId": sender_wxid, "senderName": chat,
+                        "chatId": chat_wxid, "targetId": chat_wxid,
+                        "text": display_text, "chat": chat, "type": msg_type,
+                        "agentId": ident.agent_id, "role": ident.role,
+                        "selfWxName": self._wx_nickname, "selfWxId": self._wx_id,
+                        "ts": int(time.time() * 1000),
+                        "operate": session_operate,
+                        "fileUrl": file_url, "fileName": file_name, "fileSize": file_size,
+                    }
+                    payload_str = json.dumps(payload, ensure_ascii=False)
+                    if self._adapter.publish_safe(publish_topic, payload_str):
+                        emit("INFO", f"补发媒体消息 -> {publish_topic} file={file_name}", ident.role)
+            except Exception as e:
+                emit("ERROR", f"异步媒体处理异常: {e}")
+
+        threading.Thread(target=_run, daemon=True, name=f"media-{chat[:8]}").start()
 
     def _save_latest_media(self, chat: str, msg_type: str) -> tuple[str, int, str] | None:
         """用 Messages.save_media 保存最新一张图片/视频 → 上传 MinIO。"""

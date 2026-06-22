@@ -23,6 +23,7 @@ wechat_message（反向回复，含 targetName/targetId）内部按 send_text �
 from __future__ import annotations
 
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -47,9 +48,36 @@ def _field(task: dict, key: str, default=None):
 
 
 class TaskExecutor:
-    def __init__(self, log_func=None) -> None:
+    def __init__(self, log_func=None, wx_busy_event=None, resolver=None) -> None:
         self._log = log_func or emit
-        self._resolver: ContactResolver | None = None
+        self._resolver: ContactResolver | None = resolver  # 可共享实例
+        self._wx_busy_event = wx_busy_event  # threading.Event, set during UI ops
+        self._ui_lock: threading.Lock | None = None  # UI 互斥锁（由 coordinator 注入）
+
+    def _enter_ui(self) -> None:
+        """获取 UI 锁 + 重置微信到聊天主页，确保后续操作从干净状态开始。"""
+        if self._ui_lock:
+            if not self._ui_lock.acquire(timeout=30):
+                raise RuntimeError("UI 锁获取超时 (30s)，可能有残留任务占用")
+        # 强制回到聊天列表主页，消除上一个操作（如 add_friend）遗留的页面状态
+        try:
+            mw = Navigator.open_weixin(is_maximize=False)
+            mw.child_window(**SideBar.Weixin).click_input()
+            time.sleep(0.15)
+        except Exception:
+            pass
+        if self._wx_busy_event:
+            self._wx_busy_event.set()
+
+    def _exit_ui(self) -> None:
+        """释放 UI 锁，标记退出 UI 操作。"""
+        if self._wx_busy_event:
+            self._wx_busy_event.clear()
+        if self._ui_lock:
+            try:
+                self._ui_lock.release()
+            except RuntimeError:
+                pass
 
     @staticmethod
     def _click_session(who: str) -> None:
@@ -167,25 +195,27 @@ class TaskExecutor:
             self._log("INFO", f"联系人解析: {target} → {effective} (matched_by={resolved.matched_by})")
 
         results = []
+        local_file = None
         if file_url:
-            local = self.download_file(file_url)
-            if local:
-                try:
-                    Files.send_files_to_friend(friend=effective, files=[str(local)],
-                                               with_messages=bool(message),
-                                               messages=[message] if message else [""],
-                                               close_weixin=False)
-                    results.append("file: ok")
-                except Exception as e:
-                    return {"status": "error", "error": f"文件发送失败: {e}"}
-            else:
+            local_file = self.download_file(file_url)
+            if not local_file:
                 return {"status": "error", "error": f"文件下载失败: {file_url[:100]}"}
-        if message and not file_url:
-            Messages.send_messages_to_friend(friend=effective, messages=[message], close_weixin=False)
-            results.append("text: ok")
-        if not results:
-            return {"status": "error", "error": "既无 message 也无 fileUrl"}
-        self._click_session(effective)
+        try:
+            self._enter_ui()
+            if local_file:
+                Files.send_files_to_friend(friend=effective, files=[str(local_file)],
+                                           with_messages=bool(message),
+                                           messages=[message] if message else [""],
+                                           close_weixin=False)
+                results.append("file: ok")
+            if message and not file_url:
+                Messages.send_messages_to_friend(friend=effective, messages=[message], close_weixin=False)
+                results.append("text: ok")
+            if not results:
+                return {"status": "error", "error": "既无 message 也无 fileUrl"}
+            self._click_session(effective)
+        finally:
+            self._exit_ui()
         return {"status": "success", "wechatResult": True, "wechatRaw": "; ".join(results)}
 
     # ---- add_friend ----
@@ -202,42 +232,48 @@ class TaskExecutor:
         if not target:
             return {"status": "error", "error": "缺少 target 参数"}
 
+        listen_name = remark or target
         chat_only = permission == "仅聊天"
+
+        # 同步执行 UI（2-5s），异常直接返回；max_workers=2 保证不阻塞 send_text
         try:
-            nickname = FriendSettings.add_new_friend(number=target, greetings=verify_text or None,
-                                          remark=remark or None, chat_only=chat_only, close_weixin=False)
+            self._enter_ui()
+            try:
+                nickname = FriendSettings.add_new_friend(number=target, greetings=verify_text or None,
+                                              remark=remark or None, chat_only=chat_only, close_weixin=False)
+            finally:
+                self._exit_ui()
         except Exception as e:
             return {"status": "error", "error": f"添加好友失败: {e}"}
+
         self._log("INFO", f"好友请求已发送: {target} (昵称: {nickname})")
         if tags or permission == "朋友圈":
             self._log("WARNING", "pyweixin 暂不支持 tags/朋友圈权限，已跳过（已知 gap）")
 
-        # 直接追加到联系人缓存，避免全量刷新通讯录
+        # 追加联系人缓存
         contact_info = {
-            "昵称": nickname,
-            "微信号": target,
-            "地区": "",
-            "备注": remark if remark else "",
-            "电话": "",
-            "标签": "",
-            "描述": "",
-            "朋友权限": permission,
-            "共同群聊": "",
-            "个性签名": "",
-            "来源": "",
+            "昵称": nickname, "微信号": target,
+            "地区": "", "备注": remark if remark else "",
+            "电话": "", "标签": "", "描述": "",
+            "朋友权限": permission, "共同群聊": "",
+            "个性签名": "", "来源": "",
         }
         try:
             self.resolver.add_contact(contact_info)
         except Exception as e:
             self._log("WARNING", f"追加联系人到缓存失败: {e}")
 
-        listen_name = remark or target
-        try:
-            bot_config.add_listen_user(listen_name)
-            self._log("INFO", f"已将 {listen_name} 加入监听列表")
-        except Exception as e:
-            self._log("WARNING", f"加入监听列表失败: {e}")
-        return {"status": "success", "action": "add_friend_sent", "target": target, "listen_name": listen_name}
+        # 加入监听列表（后台写 config，避免 os.replace 卡住回执）
+        def _bg_listen():
+            try:
+                bot_config.add_listen_user(listen_name)
+                self._log("INFO", f"已将 {listen_name} 加入监听列表")
+            except Exception as e:
+                self._log("WARNING", f"加入监听列表失败: {e}")
+        threading.Thread(target=_bg_listen, daemon=True, name=f"listen-{listen_name[:8]}").start()
+
+        return {"status": "success", "action": "add_friend_sent",
+                "target": target, "listen_name": listen_name}
 
     # ---- get_chat_history ----
     def _execute_get_chat_history(self, task: dict) -> dict:

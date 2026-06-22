@@ -49,8 +49,11 @@ class MqttCoordinator:
         self._close_chat_window = bool(self._cfg.get("close_chat_window", True))
         self._close_chat_window_delay = float(self._cfg.get("close_chat_window_delay", 1.0))
 
-        self._task_pool = ThreadPoolExecutor(max_workers=1)
+        self._task_pool = ThreadPoolExecutor(max_workers=2)
         self._wx_busy_event = threading.Event()
+        self._ui_lock = threading.Lock()  # UI 互斥锁，防止多线程同时操作微信 UI
+        self._executor._wx_busy_event = self._wx_busy_event
+        self._executor._ui_lock = self._ui_lock
 
     def _build_identity_map(self) -> None:
         for identity in self._identities:
@@ -253,7 +256,7 @@ class MqttCoordinator:
         task = json.loads(payload)
         cid = task.get("correlationId", "")
         emit("INFO", f"处理任务 event={task.get('event')} cid={cid} role={identity.role} task={payload}", identity.role)
-        self._wx_busy_event.set()
+        # wx_busy 由 executor 内部在 UI 操作期间自行管理，不在整个任务执行期持有
         try:
             future = self._task_pool.submit(self._executor.execute_task, task)
             try:
@@ -261,12 +264,15 @@ class MqttCoordinator:
             except FuturesTimeout:
                 result = {"correlationId": cid, "status": "error",
                           "result": {"error": f"任务超时 ({self._task_timeout}s)"}}
-                emit("WARNING", "任务超时，重建线程池")
+                emit("WARNING", "任务超时，重建线程池 + UI 锁")
+                # 重建 UI 锁：旧线程可能仍持有，换新锁让后续任务恢复正常
+                self._ui_lock = threading.Lock()
+                self._executor._ui_lock = self._ui_lock
                 try:
                     self._task_pool.shutdown(wait=False)
                 except Exception:
                     pass
-                self._task_pool = ThreadPoolExecutor(max_workers=1)
+                self._task_pool = ThreadPoolExecutor(max_workers=2)
             except Exception as e:
                 result = {"correlationId": cid, "status": "error",
                           "result": {"error": f"任务执行异常: {e}"}}

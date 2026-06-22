@@ -99,10 +99,16 @@ class ContactResolver:
             best = matches[0]
             return ResolveResult(success=True, display_name=self._display(best),
                                  matched_by="substring", wxid=self._get_wxid(best))
-        # 5) 未找到 → 全量拉取缓存后重试一次（联系人可能新增，限一次防死循环）
+        # 5) 未找到 → 文件重载 → 仍找不到 → 全量 UI 刷新（两阶段防死循环）
         if not getattr(self, '_resolve_retried', False):
             self._resolve_retried = True
             try:
+                # Phase 1: 从文件重载（其他 resolver 实例可能已追加，瞬时完成）
+                self._load_from_file()
+                retried = self.resolve(target)
+                if retried.success:
+                    return retried
+                # Phase 2: 全量 UI 扫描（最后手段）
                 self.refresh_cache()
                 return self.resolve(target)
             finally:
@@ -175,6 +181,7 @@ class ContactResolver:
         """追加单个联系人到缓存并持久化，避免全量刷新。
 
         线程安全。wxid 已存在则跳过；wxid 缺失则返回 False。
+        内存更新同步，文件写入异步（防止 os.replace 卡住 MQTT 任务）。
         """
         norm = self._normalize(info)
         wxid = self._get_wxid(norm)
@@ -187,7 +194,8 @@ class ContactResolver:
                 return False
             self._friends.append(norm)
             self._wxid_map[wl] = norm
-            self._save_to_file()
+        # 后台写文件：Windows 下 os.replace 可能被杀软卡住
+        threading.Thread(target=self._save_to_file, daemon=True, name="cache-save").start()
         emit("INFO", f"联系人缓存已追加: wxid={wxid} (共 {len(self._friends)} 人)")
         return True
 

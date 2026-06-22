@@ -2513,6 +2513,12 @@ class Moments():
             text_input.set_text(text)
         post_button=publish_panel.child_window(**Buttons.PostButton)
         post_button.click_input()
+        # 等微信服务器处理 + 弹出"已发送"提示消失后再关闭
+        time.sleep(2)
+        moments.close()
+        if close_weixin:
+            main_window=Navigator.open_weixin(is_maximize=is_maximize)
+            main_window.close()
     
     @staticmethod
     def post_notes(content:str=None,files:list[str]=[],text:str=None,is_maximize:bool=None,close_weixin:bool=None):
@@ -2558,6 +2564,12 @@ class Moments():
         note_window.close()
         post_button=publish_panel.child_window(**Buttons.PostButton)
         post_button.click_input()
+        # 等微信服务器处理 + 弹出"已发送"提示消失后再关闭
+        time.sleep(2)
+        publish_panel.close()
+        if close_weixin:
+            main_window=Navigator.open_weixin(is_maximize=is_maximize)
+            main_window.close()
        
 
     @staticmethod
