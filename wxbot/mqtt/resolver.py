@@ -102,18 +102,14 @@ class ContactResolver:
             best = matches[0]
             return ResolveResult(success=True, display_name=self._display(best),
                                  matched_by="substring", wxid=self._get_wxid(best))
-        # 5) 未找到 → 文件重载 → 仍找不到 → 全量 UI 刷新（两阶段防死循环）
+        # 5) 未找到 → 文件重载（其他 resolver 实例可能已追加，瞬时完成）
         if not getattr(self, '_resolve_retried', False):
             self._resolve_retried = True
             try:
-                # Phase 1: 从文件重载（其他 resolver 实例可能已追加，瞬时完成）
                 self._load_from_file()
                 retried = self.resolve(target)
                 if retried.success:
                     return retried
-                # Phase 2: 全量 UI 扫描（最后手段）
-                self.refresh_cache()
-                return self.resolve(target)
             finally:
                 self._resolve_retried = False
         return ResolveResult(success=False, error=f"未找到匹配联系人: {key}")
