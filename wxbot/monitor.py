@@ -150,14 +150,9 @@ def _process_one(main_window, chat: str, sender: str, text: str,
                  msg_type: str, current_friend: Optional[str],
                  processed: set[str], file_path: str | None = None) -> None:
     if msg_type == "系统消息":
-        # 好友通过验证消息 → 主动触发新好友回调
+        # 好友通过验证的系统消息(带红点)忽略,统一由 ③ _check_pending_friends 模拟转发
         if any(kw in text for kw in ("已通过", "现在可以开始聊天", "已添加", "accepted")):
-            log.info(f"[新好友回调] 检测到好友通过: {text[:80]}")
-            try:
-                from .friends import check_and_pass_once
-                check_and_pass_once()
-            except Exception as e:
-                log.error(f"[新好友回调] 异常: {e}")
+            log.info(f"[系统消息] 好友通过验证,忽略红点,由 pending 机制统一模拟转发")
         return
     if msg_type in ("被拉黑", "被删除"):
         log.warning(f"⚠️ {chat} 可能{msg_type}: {text!r}")
@@ -389,7 +384,7 @@ class Monitor:
             try:
                 mqtt_worker.on_wechat_message(
                     chat=m, sender=m,
-                    content="我已通过您的好友请求，现在可以聊天了",
+                    content="我通过了你的朋友验证请求，现在我们可以开始聊天了",
                     msg_type="文本")
                 remove_pending(m)
                 log.info(f"[新好友通过] {m} 出现在会话列表,已模拟通知并转发 MQTT")
