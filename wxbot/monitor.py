@@ -139,7 +139,8 @@ def _clear_pending_if_match(name: str) -> bool:
         for p in load_pending():
             m = p.get("match", "")
             if m and (m == name or m in name or name in m):
-                # 立即模拟好友通过通知转发 MQTT
+                # 模拟好友通过通知转发 MQTT(延迟10秒,更自然)
+                time.sleep(10)
                 try:
                     mqtt_worker.on_wechat_message(
                         chat=m, sender=m,
