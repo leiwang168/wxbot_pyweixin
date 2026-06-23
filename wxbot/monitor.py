@@ -127,10 +127,10 @@ def read_chat_messages(main_window, number: int = 5) -> list[tuple[str, str, str
 # 单条消息处理
 # ---------------------------------------------------------------------------
 def _clear_pending_if_match(name: str) -> bool:
-    """若 name 匹配某个待通过好友,移除其标记并返回 True。
+    """若 name 匹配某个待通过好友,立即模拟转发 + 移除标记 + 返回 True。
 
-    对方通过后主动发来消息(带红点,被 ② 处理)时忽略该消息,
-    统一由 ③ _check_pending_friends 模拟"已通过好友请求"转发 MQTT。
+    对方通过后主动发来消息(带红点,被 ② 处理)时忽略原消息,
+    直接在此处模拟"已通过好友请求"转发 MQTT(不等 ③ 轮询)。
     """
     if not name:
         return False
@@ -139,8 +139,16 @@ def _clear_pending_if_match(name: str) -> bool:
         for p in load_pending():
             m = p.get("match", "")
             if m and (m == name or m in name or name in m):
+                # 立即模拟好友通过通知转发 MQTT
+                try:
+                    mqtt_worker.on_wechat_message(
+                        chat=m, sender=m,
+                        content="我通过了你的朋友验证请求，现在我们可以开始聊天了",
+                        msg_type="文本")
+                    log.info(f"[新好友通过] {m} 主动发来消息,已立即模拟转发,忽略原消息")
+                except Exception as e:
+                    log.error(f"[新好友通过] 模拟转发 {m} 失败: {e}")
                 remove_pending(m)
-                log.info(f"[新好友通过] {m} 主动发来消息,忽略,由 pending 机制统一模拟转发")
                 return True
     except Exception:
         pass
