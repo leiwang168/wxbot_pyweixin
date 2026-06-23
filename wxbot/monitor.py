@@ -126,24 +126,25 @@ def read_chat_messages(main_window, number: int = 5) -> list[tuple[str, str, str
 # ---------------------------------------------------------------------------
 # 单条消息处理
 # ---------------------------------------------------------------------------
-def _clear_pending_if_match(name: str) -> None:
-    """若 name 匹配某个待通过好友,移除其标记。
+def _clear_pending_if_match(name: str) -> bool:
+    """若 name 匹配某个待通过好友,移除其标记并返回 True。
 
-    对方主动发来消息(带红点,被 ② 处理)时调用,避免 ③ 再重复模拟"已通过好友请求"。
-    匹配用双向子串(pending 的 match 是备注/昵称,name 是会话标识/显示名)。
+    对方通过后主动发来消息(带红点,被 ② 处理)时忽略该消息,
+    统一由 ③ _check_pending_friends 模拟"已通过好友请求"转发 MQTT。
     """
     if not name:
-        return
+        return False
     try:
         from .pending_friends import load_pending, remove_pending
         for p in load_pending():
             m = p.get("match", "")
             if m and (m == name or m in name or name in m):
                 remove_pending(m)
-                log.info(f"[新好友通过] {m} 主动发来消息,跳过模拟通知")
-                break
+                log.info(f"[新好友通过] {m} 主动发来消息,忽略,由 pending 机制统一模拟转发")
+                return True
     except Exception:
         pass
+    return False
 
 
 def _process_one(main_window, chat: str, sender: str, text: str,
@@ -176,8 +177,9 @@ def _process_one(main_window, chat: str, sender: str, text: str,
 
     log.info(f"[收到] {chat}({sender}) [{msg_type}]: {text!r}")
 
-    # 若是待通过好友主动发来消息,清除其标记(避免 ③ 重复模拟"已通过好友请求")
-    _clear_pending_if_match(chat)
+    # 若是待通过好友发来消息,忽略(不转发不回复),统一由 ③ pending 机制模拟转发
+    if _clear_pending_if_match(chat):
+        return
 
     # 监听过滤：白名单/黑名单同时控制本地回复和 MQTT 转发
     if not is_listened_chat(chat, is_group):
