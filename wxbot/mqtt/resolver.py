@@ -53,9 +53,11 @@ class ContactResolver:
         self._load_from_file()
         # 缓存文件不存在或为空 → 启动后自动全量拉取一次
         if not self._friends:
-            emit("INFO", "联系人缓存为空，启动后自动刷新（超时120s）...")
+            from ..config import bot_config
+            _timeout = int(bot_config.get("contacts_refresh_timeout", 300))
+            emit("INFO", f"联系人缓存为空，启动后自动刷新（超时{_timeout}s）...")
             try:
-                self.refresh_cache(timeout=120)
+                self.refresh_cache(timeout=_timeout)
             except Exception as e:
                 emit("ERROR", f"启动时联系人缓存自动刷新失败: {e}")
 

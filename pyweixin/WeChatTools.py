@@ -926,7 +926,7 @@ class Navigator():
         if old_version:
             friend_button=chatinfo_pane.child_window(title=friend,control_type='Button')
         else:
-            friend_button=main_window.child_window(auto_id='single_chat_member_cell',control_type='Button')
+            friend_button=main_window.child_window(auto_id='single_chat_member_cell')
         if friend_button.exists(timeout=3):
             if not old_version:
                 profile_pane=desktop.window(**Windows.PopUpProfileWindow)
@@ -938,7 +938,12 @@ class Navigator():
                     click_pos=MousePos(friend_button).FriendProfilePos
                     mouse.click(coords=click_pos)
                 else:
-                    friend_button.click_input()
+                    # 点头像(cell)精确矩形中心坐标,避免 click_input 偏到旁边的"添加(add)"
+                    try:
+                        _r=friend_button.element_info.rectangle
+                        mouse.click(coords=((_r.left+_r.right)//2,(_r.top+_r.bottom)//2))
+                    except Exception:
+                        friend_button.click_input()
                 if profile_pane.exists(timeout=1.5):
                     break
                 time.sleep(0.3)

@@ -319,6 +319,7 @@ class Group_Control():
         self.ContactProfileViewGroup={'title':'','control_type':'Group','class_name':'mmui::ContactProfileView'}#添加好友界面内搜索微信号后弹出的好友信息(带有添加到通讯录按钮)组
         if '4.1.9' in self.Version:
              self.ContactProfileViewGroup={'title':'','control_type':'Group','class_name':'mmui::ProfileView'}#添加好友界面内搜索微信号后弹出的好友信息(带有添加到通讯录按钮)组
+             self.ContactProfileGroup={'class_name':'mmui::DetailView','control_type':'Group'}#4.1.9.35 profile_view 被 DetailView 替代
         if self.language=='简体中文':
             self.AtGroup={'title':'提醒谁看','class_name':'mmui::PublishComponent','control_type':'Group'}#发布微信朋友圈内的提醒谁看
             self.WhoCanSeeGroup={'title':'谁可以看','class_name':'mmui::PublishComponent','control_type':'Group'}#发布微信朋友圈内的谁可以看

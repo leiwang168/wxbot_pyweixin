@@ -3165,22 +3165,27 @@ class Moments():
             content=re.sub(r'^\s+','',content)
             return content,photo_num,video_num,post_time
 
+        def _click_ellipsis(rect):
+            #4.1.9.15: 点赞/评论".."实测在 rect.right-83, rect.bottom-19(避开右侧窗口关闭区)
+            cx=rect.right-83
+            cy=rect.bottom-19
+            mouse.move(coords=(cx,cy))
+            time.sleep(0.6)
+            mouse.click(coords=(cx,cy))
+            time.sleep(0.6)
+
         def like(listview:ListViewWrapper,content_listitem:ListItemWrapper):
             #点赞操作
-            center_point=(listview.rectangle().mid_point().x,listview.rectangle().mid_point().y)
-            mouse.move(coords=center_point)
             rectangle=content_listitem.rectangle()
-            ColorMatch.click_gray_ellipsis_button(rectangle)
-            if like_button.exists(timeout=0.1):
+            _click_ellipsis(rectangle)
+            if like_button.exists(timeout=1):
                 like_button.click_input()
 
         def comment(listview:ListViewWrapper,content_listitem:ListItemWrapper,content:str):
             #评论操作
             comment_listitem=Tools.get_next_item(listview,content_listitem)
-            center_point=(listview.rectangle().mid_point().x,listview.rectangle().mid_point().y)
-            mouse.move(coords=center_point)
-            ColorMatch.click_gray_ellipsis_button(content_listitem.rectangle())
-            reply=callback(content) 
+            _click_ellipsis(content_listitem.rectangle())
+            reply=callback(content)
             if comment_button.exists(timeout=0.1) and reply is not None:
                 comment_button.click_input()
                 pyautogui.hotkey('ctrl','a')
@@ -3202,26 +3207,51 @@ class Moments():
         backbutton=moments_window.child_window(**Buttons.BackButton)
         moments_list=moments_window.child_window(**Lists.MomentsList)
         sns_detail_list=moments_window.child_window(**Lists.SnsDetailList)
-        like_button=moments_window.child_window(**Buttons.LikeButton)
-        comment_button=moments_window.child_window(**Buttons.CommentButton)
+        like_button=moments_window.child_window(title='赞',control_type='Button')
+        comment_button=moments_window.child_window(title='评论',control_type='Button')
         moments_list.type_keys('{END}')
         moments_list.type_keys('{HOME}')
         contents=[listitem for listitem in moments_list.children(control_type='ListItem') if listitem.class_name() not in not_contents]
         if contents:
+            _com_fails=0
             while True:
-                moments_list.type_keys('{DOWN}')
-                selected=[listitem for listitem in moments_list.children(control_type='ListItem') if listitem.has_keyboard_focus()]
+                try:
+                    moments_list.type_keys('{DOWN}')
+                    selected=[listitem for listitem in moments_list.children(control_type='ListItem') if listitem.has_keyboard_focus()]
+                except Exception:
+                    _com_fails+=1
+                    if _com_fails>3:
+                        print('[Moments] UI COM 错误连续多次,终止点赞')
+                        break
+                    time.sleep(0.5)
+                    continue
+                _com_fails=0
                 if selected and selected[0].class_name() not in not_contents:
                     selected[0].click_input()
-                    content_listitem=sns_detail_list.children(control_type='ListItem')[0]
-                    content,photo_num,video_num,post_time=parse_friend_post(content_listitem)
-                    posts.append({'内容':content,'图片数量':photo_num,'视频数量':video_num,'发布时间':post_time})
-                    like(sns_detail_list,content_listitem)
-                    if callback is not None:
-                        comment(sns_detail_list,content_listitem,content)
-                    liked_num+=1
-                    backbutton.click_input()
-                    moments_list.wait(wait_for='ready',timeout=1)
+                    # sns_detail_list 偶发不弹(点击未生效/COM),检查存在再处理,否则跳过该条
+                    if not sns_detail_list.exists(timeout=1):
+                        try:
+                            backbutton.click_input()
+                        except Exception:
+                            pass
+                        continue
+                    try:
+                        content_listitem=sns_detail_list.children(control_type='ListItem')[0]
+                        content,photo_num,video_num,post_time=parse_friend_post(content_listitem)
+                        posts.append({'内容':content,'图片数量':photo_num,'视频数量':video_num,'发布时间':post_time})
+                        like(sns_detail_list,content_listitem)
+                        if callback is not None:
+                            comment(sns_detail_list,content_listitem,content)
+                        liked_num+=1
+                        backbutton.click_input()
+                        moments_list.wait(wait_for='ready',timeout=1)
+                    except Exception as e:
+                        print(f'[Moments] 点赞/评论该条异常,跳过: {e}')
+                        try:
+                            backbutton.click_input()
+                        except Exception:
+                            pass
+                        continue
                     if Tools.is_sns_at_bottom(moments_list,selected[0]):
                         break
                 if liked_num>=number:

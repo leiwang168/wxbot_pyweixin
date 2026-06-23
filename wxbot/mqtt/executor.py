@@ -330,10 +330,20 @@ class TaskExecutor:
 
     # ---- get_friend_details ----
     def _execute_get_friend_details(self, task: dict) -> dict:
-        try:
-            details = Contacts.get_friends_detail(close_weixin=False)
-        except Exception as e:
-            return {"status": "error", "error": str(e)}
+        # 优先读联系人缓存(瞬时),缓存空才全量 UI 扫描
+        details = None
+        if self.resolver.cache_ready:
+            with self.resolver._lock:
+                details = list(self.resolver._friends)
+        if not details:
+            self._log("INFO", "[get_friend_details] 缓存空,尝试全量 UI 扫描")
+            try:
+                details = Contacts.get_friends_detail(close_weixin=False)
+            except Exception as e:
+                # 全量扫描失败(如 4.1.9.35 UI 异常)不报 error,返回空列表 + warning
+                self._log("WARNING", f"[get_friend_details] 全量扫描失败,返回空: {e}")
+                return {"status": "success", "friends": [], "count": 0,
+                        "warning": f"联系人缓存为空且全量扫描失败: {e}"}
         if not details:
             return {"status": "success", "friends": [], "count": 0}
         name_prefix_raw = _field(task, "name_prefix", "")
