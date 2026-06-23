@@ -355,7 +355,7 @@ class Monitor:
             session_list.type_keys("{HOME}")
             time.sleep(0.2)
             prev_last = None
-            for _ in range(60):  # max_pages
+            for _ in range(10):  # 只扫会话列表前10条(最近的会话)
                 try:
                     items = session_list.children(control_type="ListItem")
                 except Exception:
