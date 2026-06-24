@@ -410,6 +410,8 @@ class Tools():
             listitem:在列表中要判断是否为底部的listitem
         '''
         next_item=Tools.get_next_item(listview,listitem)
+        if next_item is None:
+            return True  # 无下一项,视为到底
         if next_item.class_name()=='mmui::AlbumBaseCell' and next_item.window_text()=='':#到达最底部
             return True
         return False
@@ -926,8 +928,12 @@ class Navigator():
         if old_version:
             friend_button=chatinfo_pane.child_window(title=friend,control_type='Button')
         else:
-            friend_button=main_window.child_window(auto_id='single_chat_member_cell')
-        if friend_button.exists(timeout=3):
+            # 遍历取最右侧 cell(好友面板),避免 child_window 匹配到侧边栏自己的头像
+            _cells=[d for d in main_window.descendants()
+                    if d.element_info.automation_id=='single_chat_member_cell']
+            _cells.sort(key=lambda d: d.element_info.rectangle.left, reverse=True)
+            friend_button=_cells[0] if _cells else None
+        if friend_button is not None:
             if not old_version:
                 profile_pane=desktop.window(**Windows.PopUpProfileWindow)
             else:

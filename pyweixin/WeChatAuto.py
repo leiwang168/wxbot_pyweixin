@@ -3180,6 +3180,9 @@ class Moments():
             _click_ellipsis(rectangle)
             if like_button.exists(timeout=1):
                 like_button.click_input()
+                print('[Moments] 点赞成功')
+            else:
+                print('[Moments] like_button 未出现,无法点赞')
 
         def comment(listview:ListViewWrapper,content_listitem:ListItemWrapper,content:str):
             #评论操作

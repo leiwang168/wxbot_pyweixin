@@ -279,13 +279,10 @@ class Scheduler:
         t1 = threading.Thread(target=friends.new_friend_loop, args=(self._stop,), name="new_friend", daemon=True)
         t2 = threading.Thread(target=moments.like_loop, args=(self._stop,), name="moments_like", daemon=True)
         t3 = threading.Thread(target=tick, name="scheduler_tick", daemon=True)
-        # 每日朋友圈导出(23:00-24:00 随机点,用 ui_lock 与 monitor/MQTT 互斥)
-        from .moments_export import run_moments_export_loop
-        t4 = threading.Thread(target=run_moments_export_loop, args=(self._stop,), name="moments_export", daemon=True)
-        for t in (t1, t2, t3, t4):
+        for t in (t1, t2, t3):
             t.start()
             self._threads.append(t)
-        log.info("⏰ 调度器已启动（定时消息/朋友圈 + 随机窗口 + 新好友 + 点赞 + 每日朋友圈导出）")
+        log.info("⏰ 调度器已启动（定时消息/朋友圈 + 随机窗口 + 新好友 + 点赞）")
 
     def stop(self) -> None:
         self._stop.set()
