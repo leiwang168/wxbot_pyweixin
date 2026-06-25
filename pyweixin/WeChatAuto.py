@@ -3210,7 +3210,7 @@ class Moments():
         backbutton=moments_window.child_window(**Buttons.BackButton)
         moments_list=moments_window.child_window(**Lists.MomentsList)
         sns_detail_list=moments_window.child_window(**Lists.SnsDetailList)
-        like_button=moments_window.child_window(title='赞',control_type='Button')
+        like_button=moments_window.child_window(title='点赞',control_type='Button')
         comment_button=moments_window.child_window(title='评论',control_type='Button')
         moments_list.type_keys('{END}')
         moments_list.type_keys('{HOME}')

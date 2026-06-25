@@ -198,6 +198,46 @@ class ContactResolver:
         emit("INFO", f"联系人缓存已追加: wxid={wxid} (共 {len(self._friends)} 人)")
         return True
 
+    def update_or_add_by_remark(self, info: dict) -> bool:
+        """按备注查找：存在则更新（含微信号），不存在则新增。
+
+        用于新好友查资料卡后回填真实微信号——全量缓存里该好友可能已有
+        不准的 wxid（如 bb15129562650），需按备注定位并覆盖。
+        线程安全；内存更新同步，文件写入异步。
+        """
+        norm = self._normalize(info)
+        remark = self._get_remark(norm)
+        if not remark:
+            emit("WARNING", "update_or_add_by_remark: info dict 无备注，跳过")
+            return False
+        with self._lock:
+            target = None
+            for f in self._friends:
+                if self._get_remark(f) == remark:
+                    target = f
+                    break
+            if target is not None:
+                # 删除旧 wxid 索引（指向该条目），更新字段后重建索引
+                old_wxid = self._get_wxid(target).lower()
+                if old_wxid and self._wxid_map.get(old_wxid) is target:
+                    del self._wxid_map[old_wxid]
+                for k, v in norm.items():
+                    if v:
+                        target[k] = v
+                new_wxid = self._get_wxid(target).lower()
+                if new_wxid:
+                    self._wxid_map[new_wxid] = target
+            else:
+                wxid = self._get_wxid(norm)
+                if not wxid:
+                    emit("WARNING", f"update_or_add_by_remark: 备注未匹配且无微信号，跳过: {remark}")
+                    return False
+                self._friends.append(norm)
+                self._wxid_map[wxid.lower()] = norm
+        threading.Thread(target=self._save_to_file, daemon=True, name="cache-save").start()
+        emit("INFO", f"联系人缓存已更新(按备注={remark}) 共 {len(self._friends)} 人")
+        return True
+
     # ---- 内部 ----
     def _load_from_file(self) -> None:
         """从缓存文件加载,采用 merge 语义(不覆盖内存中已有条目)。

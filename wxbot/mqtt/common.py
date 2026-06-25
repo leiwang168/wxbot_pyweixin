@@ -112,7 +112,7 @@ class MinioUploader:
             ext = local.suffix or ".bin"
             ts = int(time.time())
             short = uuid.uuid4().hex[:8]
-            object_name = f"{chat}/{ts}_{short}{ext}" if chat else f"{ts}_{short}{ext}"
+            object_name = f"chat-files/{chat}/{ts}_{short}{ext}" if chat else f"chat-files/{ts}_{short}{ext}"
             ct, _ = mimetypes.guess_type(str(local))
             self._client.fput_object(self._bucket, object_name, str(local),
                                      content_type=ct or "application/octet-stream")

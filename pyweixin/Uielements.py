@@ -103,7 +103,7 @@ class Button_Control():
             self.NotificationButton={'title':'通知','control_type':'Button'}#微信设置里的通知按钮
             self.RotateButton={'title':'旋转','control_type':'Button'}#图片预览窗口内的旋转按钮
             self.JoinGroupButton={'title':'加入群聊','control_type':'Button'}#群聊邀请界面内的加入群聊按钮(点击群聊邀请链接后出现的窗口)
-            self.LikeButton={'title':'赞','control_type':'Button'}#点击朋友圈单个内容下方的灰色省略号后弹出的点赞按钮
+            self.LikeButton={'title':'点赞','control_type':'Button'}#点击朋友圈单个内容下方的灰色省略号后弹出的点赞按钮
             self.CommentButton={'title':'评论','control_type':'Button'}#点击朋友圈单个内容下方的灰色省略号后弹出的评论按钮
             self.SendMessageButton={'title':'发消息','control_type':'Button'}#添加好友窗口里的发消息按钮
             self.VerifyNowButton={'title':'前往验证','control_type':'Button'}#通讯录新朋友界面中前往验证按钮

@@ -13,7 +13,11 @@ import time
 import uuid
 from pathlib import Path
 
-from pyweixin import Contacts
+import pyautogui
+
+from pyweixin import Contacts, GlobalConfig
+from pyweixin.WeChatTools import Navigator, desktop, mouse
+from pyweixin.Uielements import Windows
 
 from ..config import bot_config
 from .adapter import MqttAdapter
@@ -25,6 +29,39 @@ from .resolver import ContactResolver
 
 _CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))), "config", "config.json")
+
+
+def _patch_open_friend_profile():
+    """monkeypatch：修复 4.1.9.35 下 open_friend_profile 点头像弹资料卡不稳定。
+
+    头像在好友按钮左侧，精确点击按钮宽度 1/8 处避免误触"添加"等按钮。
+    不最大化窗口、点头像前延迟1秒等 COM 稳定。
+    """
+    def _patched(friend, is_maximize=None, search_pages=None):
+        if search_pages is None:
+            search_pages = GlobalConfig.search_pages
+        # 不最大化：避免窗口缩放影响 monitor 轮询
+        chatinfo_pane, main_window = Navigator.open_chatinfo(
+            friend=friend, is_maximize=False, search_pages=search_pages)
+        friend_button = chatinfo_pane.child_window(title=friend, control_type='Button')
+        if not friend_button.exists(timeout=3):
+            main_window.close()
+            raise RuntimeError(f'找不到好友按钮：{friend}')
+        btn_rect = friend_button.rectangle()
+        # 头像紧贴按钮左侧，用固定小偏移命中头像中心（避免点到右边缘）
+        avatar_pos = (btn_rect.left + 3,
+                      btn_rect.top + (btn_rect.bottom - btn_rect.top) // 3)
+        profile_pane = desktop.window(**Windows.PopUpProfileWindow)
+        time.sleep(1)  # 点击头像前延迟，等聊天信息面板 COM 稳定
+        # 循环点击，每次微调向左偏移提高命中率
+        for dx in (-8, -5, -2):
+            mouse.click(coords=(avatar_pos[0] + dx, avatar_pos[1]))
+            time.sleep(1.5)
+            if profile_pane.exists(timeout=4):
+                time.sleep(2.5)
+                return profile_pane, main_window
+        raise RuntimeError('点击头像后资料卡弹窗未出现')
+    Navigator.open_friend_profile = staticmethod(_patched)
 
 
 class MqttWorkerExtension:
@@ -94,6 +131,11 @@ class MqttWorkerExtension:
 
     # ---- 生命周期 ----
     def initialize(self) -> None:
+        # 修复 open_friend_profile 点头像不稳定（get_friend_profile 依赖它）
+        try:
+            _patch_open_friend_profile()
+        except Exception as e:
+            emit("WARNING", f"open_friend_profile monkeypatch 失败: {e}")
         self._refresh_wx_account_info()
         cfg = bot_config.get("mqtt_worker", {}) or {}
         self._uploader = MinioUploader(cfg.get("minio", {}) or {})
@@ -210,6 +252,26 @@ class MqttWorkerExtension:
         emit("INFO", f"MQTT 数字员工热重载完成 共 {len(self._identities)} 个身份")
         self._validate_multi_identity()
 
+    def _fetch_wxid_from_profile(self, friend: str) -> str:
+        """打开好友资料卡获取微信号，写入缓存。新好友首条消息时调用（阻塞 UI 操作）。
+
+        close_weixin=False 避免关闭微信窗口影响后续 monitor 轮询。
+        返回微信号；失败返回空串。
+        """
+        try:
+            emit("INFO", f"[新好友] 打开资料卡获取微信号: {friend}")
+            profile = Contacts.get_friend_profile(friend, close_weixin=False)
+            wxid = (profile.get("微信号") or "").strip()
+            if wxid and wxid != "无":
+                # 按备注更新缓存（覆盖全量缓存里不准的 wxid），而非 add_contact（wxid 去重会漏）
+                self.resolver.update_or_add_by_remark(profile)
+                emit("INFO", f"[新好友] 获取微信号成功: {friend} -> {wxid}")
+                return wxid
+            emit("WARNING", f"[新好友] 资料卡未取到微信号: {friend}")
+        except Exception as e:
+            emit("WARNING", f"[新好友] 获取微信号失败: {friend} -> {e}")
+        return ""
+
     # ---- 微信事件转发 ----
     def on_wechat_message(self, chat: str, sender: str, content: str,
                           msg_type: str = "text", file_url: str | None = None,
@@ -242,9 +304,10 @@ class MqttWorkerExtension:
                 else:
                     display_text = f"[{msg_type}]"
             elif msg_type in ("图片", "视频"):
-                display_text = f"[{msg_type}]"
+                # 图片/视频：只走异步补发（带 fileUrl），不再同步发 "[图片]" 占位消息
                 # 异步保存+上传：避免同步 UI 操作阻塞 monitor 线程导致后续消息丢失
                 self._launch_async_media_followup(chat, sender, msg_type)
+                return True
             else:
                 display_text = f"[{msg_type}]"
 
@@ -281,6 +344,22 @@ class MqttWorkerExtension:
                     pass
             else:
                 chat_wxid = sender_wxid
+
+        # 新好友（在 pending 待通过列表里）→ 阻塞查资料卡获取真实微信号
+        # pending 由 add_pending 写入（加好友成功时），好友通过并发消息触发此处
+        try:
+            from ..pending_friends import load_pending
+            is_new_friend = any(
+                (m := p.get("match", "")) and (m == chat or m in chat or chat in m)
+                for p in load_pending()
+            )
+        except Exception:
+            is_new_friend = False
+        if is_new_friend:
+            wxid = self._fetch_wxid_from_profile(chat)
+            if wxid:
+                sender_wxid = wxid
+                chat_wxid = wxid
 
         # 二次核查自身账号
         if sender_wxid in (self._wx_id, self._wx_wechat_id):
