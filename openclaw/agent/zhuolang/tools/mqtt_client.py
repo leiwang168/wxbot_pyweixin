@@ -324,6 +324,22 @@ class ProcurementAgent:
         cid = self._publish_task('get_friend_details', fields)
         return cid, self._wait_callback(cid, timeout)
 
+    def get_friend_moments(self, target_name, start_date, end_date, limit=50):
+        """异步下发获取好友朋友圈指令，立即返回 cid，不等回调（朋友圈获取耗时较长）。
+
+        结果由常驻 mqtt_listener 收到 moments_task_result 回调后，
+        写入 records/friend_moments/<好友>.json。
+
+        :param target_name: 好友备注/昵称
+        :param start_date: 开始日期 'YYYY-MM-DD'（含）
+        :param end_date: 结束日期 'YYYY-MM-DD'（含）
+        :param limit: 最多获取条数（默认 50，上限 100）
+        :return: correlationId（字符串）；不阻塞等待回调
+        """
+        fields = {'targetName': target_name, 'startDate': start_date,
+                  'endDate': end_date, 'limit': int(limit)}
+        return self._publish_task('get_friend_moments', fields)
+
     def parse_messages(self, callback_data):
         """从回调数据中提取消息列表"""
         if not callback_data:

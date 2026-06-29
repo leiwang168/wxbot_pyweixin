@@ -48,9 +48,10 @@ def _field(task: dict, key: str, default=None):
 
 
 class TaskExecutor:
-    def __init__(self, log_func=None, wx_busy_event=None, resolver=None) -> None:
+    def __init__(self, log_func=None, wx_busy_event=None, resolver=None, uploader=None) -> None:
         self._log = log_func or emit
         self._resolver: ContactResolver | None = resolver  # 可共享实例
+        self._uploader = uploader  # MinioUploader 实例（get_friend_moments 截图上传用，可共享）
         self._wx_busy_event = wx_busy_event  # threading.Event, set during UI ops
         self._ui_lock: threading.Lock | None = None  # UI 互斥锁（由 coordinator 注入）
 
@@ -363,6 +364,38 @@ class TaskExecutor:
             friends = friends[:n_val]
         return {"status": "success", "friends": friends, "count": len(friends)}
 
+    # ---- get_contacts_cache ----
+    def _execute_get_contacts_cache(self, task: dict) -> dict:
+        """只读通讯录缓存，排除 pending_friends.json 里的待通过好友。缓存空返回空+warning。"""
+        if not self.resolver.cache_ready:
+            return {"status": "success", "contacts": [], "count": 0,
+                    "excluded_pending": 0, "warning": "通讯录缓存为空"}
+
+        # pending.match 语义：备注优先，无备注用昵称（pending_friends.py:7）
+        try:
+            from ..pending_friends import load_pending
+            pending_matches = {p.get("match", "").strip()
+                               for p in load_pending() if p.get("match")}
+        except Exception:
+            pending_matches = set()
+
+        contacts = []
+        excluded = 0
+        for fr in self.resolver.get_all_contacts():
+            if not isinstance(fr, dict):
+                continue
+            remark = str(fr.get("备注", "") or "").strip()
+            nickname = str(fr.get("昵称", "") or "").strip()
+            # 与 pending.match 同语义：有备注比备注，无备注比昵称
+            key = remark if remark else nickname
+            if key and key in pending_matches:
+                excluded += 1
+                continue
+            contacts.append({k: ("" if v is None else str(v)) for k, v in fr.items()})
+
+        return {"status": "success", "contacts": contacts,
+                "count": len(contacts), "excluded_pending": excluded}
+
     # ---- refresh_contacts ----
     def _execute_refresh_contacts(self, task: dict) -> dict:
         result = self.resolver.refresh_cache()
@@ -408,6 +441,49 @@ class TaskExecutor:
         return {"status": "success", "action": "post_moments",
                 "textLength": len(text), "mediaCount": len(local_media)}
 
+    # ---- get_friend_moments ----
+    def _execute_get_friend_moments(self, task: dict) -> dict:
+        """按时间范围导出指定好友朋友圈，内容截图上传 MinIO 后回调。"""
+        target_raw = _field(task, "targetName") or _field(task, "targetId", "")
+        if not isinstance(target_raw, str) or not target_raw.strip():
+            return {"status": "error", "error": "缺少 target 参数"}
+        target = self._validate_str(target_raw, "target", MAX_TARGET_LEN)
+        start_raw = _field(task, "startDate", "")
+        end_raw = _field(task, "endDate", "")
+        start = start_raw.strip() if isinstance(start_raw, str) else ""
+        end = end_raw.strip() if isinstance(end_raw, str) else ""
+        if not start or not end:
+            return {"status": "error", "error": "缺少 startDate/endDate 参数"}
+        try:
+            limit = max(1, min(int(_field(task, "limit", 50)), 100))
+        except (TypeError, ValueError):
+            limit = 50
+
+        resolved = self.resolver.resolve(target)
+        if not resolved.success:
+            return {"status": "error", "error": resolved.error, "candidates": resolved.candidates}
+        effective = resolved.display_name
+
+        if not self._uploader or not getattr(self._uploader, "available", False):
+            return {"status": "error", "error": "MinIO 未配置，无法上传朋友圈截图"}
+
+        try:
+            from ..moments_export import dump_friend_moments_range
+            self._enter_ui()
+            try:
+                posts = dump_friend_moments_range(
+                    friend=effective, start=start, end=end,
+                    uploader=self._uploader, limit=limit, log_func=self._log)
+            finally:
+                self._exit_ui()
+        except Exception as e:
+            self._log("ERROR", f"获取朋友圈异常 {effective}: {e}")
+            return {"status": "error", "error": f"获取朋友圈失败: {e}"}
+        self._log("INFO", f"朋友圈导出 {effective} [{start}~{end}] 共 {len(posts)} 条")
+        return {"status": "success", "friend": effective,
+                "range": {"start": start, "end": end},
+                "count": len(posts), "moments": posts}
+
     # ---- ping ----
     def _execute_ping(self, task: dict) -> dict:
         return {"status": "success", "pong": True}
@@ -417,7 +493,9 @@ class TaskExecutor:
         "add_friend": _execute_add_friend,
         "get_chat_history": _execute_get_chat_history,
         "get_friend_details": _execute_get_friend_details,
+        "get_contacts_cache": _execute_get_contacts_cache,
         "ping": _execute_ping,
         "post_moments": _execute_post_moments,
         "refresh_contacts": _execute_refresh_contacts,
+        "get_friend_moments": _execute_get_friend_moments,
     }

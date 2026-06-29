@@ -176,6 +176,11 @@ class ContactResolver:
             age = time.time() - self._loaded_at if self._loaded_at else -1
         return {"size": size, "age_seconds": round(age, 1), "cache_file": self._cache_path}
 
+    def get_all_contacts(self) -> list[dict]:
+        """返回全部联系人缓存的浅拷贝（线程安全）。"""
+        with self._lock:
+            return list(self._friends)
+
     def add_contact(self, info: dict) -> bool:
         """追加单个联系人到缓存并持久化，避免全量刷新。
 

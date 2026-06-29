@@ -285,7 +285,7 @@ class MqttCoordinator:
                 self._task_fail_count += 1
 
         callback_topic = f"{identity.resolve_callback_prefix()}/{cid}"
-        result["event"] = "task_result"
+        result["event"] = "moments_task_result" if task.get("event") == "get_friend_moments" else "task_result"
         result["executedAt"] = time.strftime("%Y-%m-%dT%H:%M:%S")
         result["agentId"] = identity.agent_id
         result["role"] = identity.role

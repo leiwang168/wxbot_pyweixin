@@ -44,21 +44,27 @@ def _patch_open_friend_profile():
         chatinfo_pane, main_window = Navigator.open_chatinfo(
             friend=friend, is_maximize=False, search_pages=search_pages)
         friend_button = chatinfo_pane.child_window(title=friend, control_type='Button')
+        time.sleep(1)
         if not friend_button.exists(timeout=3):
             main_window.close()
             raise RuntimeError(f'找不到好友按钮：{friend}')
-        btn_rect = friend_button.rectangle()
-        # 头像紧贴按钮左侧，用固定小偏移命中头像中心（避免点到右边缘）
-        avatar_pos = (btn_rect.left + 3,
-                      btn_rect.top + (btn_rect.bottom - btn_rect.top) // 3)
+        # 用昵称 Text 控件推算头像中心：x=昵称水平中心-12(昵称窄于头像,中心偏右)，y=昵称.top-40
+        name_ctrl = chatinfo_pane.child_window(title=friend, control_type='Text')
+        if name_ctrl.exists(timeout=1):
+            nr = name_ctrl.rectangle()
+            avatar_x = nr.left + (nr.right - nr.left) // 2
+            avatar_y = nr.top - 40
+        else:
+            br = friend_button.rectangle()  # 兜底：昵称 Text 找不到
+            avatar_x = br.left + (br.right - br.left) // 2
+            avatar_y = br.top + 40
         profile_pane = desktop.window(**Windows.PopUpProfileWindow)
-        time.sleep(1)  # 点击头像前延迟，等聊天信息面板 COM 稳定
-        # 循环点击，每次微调向左偏移提高命中率
-        for dx in (-8, -5, -2):
-            mouse.click(coords=(avatar_pos[0] + dx, avatar_pos[1]))
-            time.sleep(1.5)
-            if profile_pane.exists(timeout=4):
-                time.sleep(2.5)
+        
+        # 循环点击，x 向左、y 上下微调提高命中率（昵称中心偏头像右边缘，需左移）
+        for dx, dy in ((0, 0), (-8, 0), (-16, 0), (-20, -0), (-24, -0)):
+            mouse.click(coords=(avatar_x + dx, avatar_y + dy))
+            if profile_pane.exists(timeout=3):
+                time.sleep(1)
                 return profile_pane, main_window
         raise RuntimeError('点击头像后资料卡弹窗未出现')
     Navigator.open_friend_profile = staticmethod(_patched)
@@ -160,7 +166,7 @@ class MqttWorkerExtension:
                      self._identities[0] if self._identities else None)
         agent_base = first.agent_id if first else "wbot"
         self._adapter = MqttAdapter(cfg, agent_base)
-        self._executor = TaskExecutor(log_func=emit, resolver=self.resolver)
+        self._executor = TaskExecutor(log_func=emit, resolver=self.resolver, uploader=self._uploader)
         self._coordinator = MqttCoordinator(cfg, self._adapter, self._executor, self._identities, extension=self)
         self._adapter.set_handlers(on_connect=lambda rc: self._on_connect(rc),
                                    on_disconnect=lambda rc: None,
@@ -242,7 +248,7 @@ class MqttWorkerExtension:
                      self._identities[0] if self._identities else None)
         agent_base = first.agent_id if first else "wbot"
         self._adapter = MqttAdapter(cfg, agent_base)
-        self._executor = TaskExecutor(log_func=emit, resolver=self.resolver)
+        self._executor = TaskExecutor(log_func=emit, resolver=self.resolver, uploader=self._uploader)
         self._coordinator = MqttCoordinator(cfg, self._adapter, self._executor, self._identities, extension=self)
         self._adapter.set_handlers(on_connect=lambda rc: self._on_connect(rc),
                                    on_disconnect=lambda rc: None,
@@ -253,24 +259,70 @@ class MqttWorkerExtension:
         self._validate_multi_identity()
 
     def _fetch_wxid_from_profile(self, friend: str) -> str:
-        """打开好友资料卡获取微信号，写入缓存。新好友首条消息时调用（阻塞 UI 操作）。
+        """打开好友资料卡获取微信号+性别，写入缓存。新好友首条消息时调用（阻塞 UI 操作）。
 
         close_weixin=False 避免关闭微信窗口影响后续 monitor 轮询。
         返回微信号；失败返回空串。
         """
         try:
             emit("INFO", f"[新好友] 打开资料卡获取微信号: {friend}")
-            profile = Contacts.get_friend_profile(friend, close_weixin=False)
+            self._enter_ui()  # 串行排队：微信客户端 UI 操作不并发
+            try:
+                # 直接拿 profile_pane：读微信号文本 + 截图识别性别
+                profile_pane, main_window = Navigator.open_friend_profile(
+                    friend=friend, is_maximize=False, search_pages=GlobalConfig.search_pages)
+                import time as _t
+                _t.sleep(2)  # 等资料卡控件渲染稳定
+                profile = self._read_profile_pane(profile_pane, friend)
+                # 关侧边栏，避免影响后续 monitor
+                try:
+                    from pyweixin.Uielements import Buttons
+                    main_window.child_window(**Buttons.ChatInfoButton).click_input()
+                except Exception:
+                    pass
+            finally:
+                self._exit_ui()
             wxid = (profile.get("微信号") or "").strip()
             if wxid and wxid != "无":
-                # 按备注更新缓存（覆盖全量缓存里不准的 wxid），而非 add_contact（wxid 去重会漏）
+                # 按备注更新缓存（覆盖全量缓存里不准的 wxid）
                 self.resolver.update_or_add_by_remark(profile)
-                emit("INFO", f"[新好友] 获取微信号成功: {friend} -> {wxid}")
+                emit("INFO", f"[新好友] 获取成功: {friend} -> wxid={wxid} 性别={profile.get('性别','')}")
                 return wxid
             emit("WARNING", f"[新好友] 资料卡未取到微信号: {friend}")
         except Exception as e:
             emit("WARNING", f"[新好友] 获取微信号失败: {friend} -> {e}")
         return ""
+
+    @staticmethod
+    def _read_profile_pane(profile_pane, friend: str) -> dict:
+        """从资料卡面板读微信号文本 + 颜色识别性别。"""
+        profile = {"备注": friend, "微信号": "无", "性别": ""}
+        try:
+            texts = [t.window_text() for t in profile_pane.descendants(control_type='Text')]
+            if "微信号：" in texts:
+                profile["微信号"] = texts[texts.index("微信号：") + 1]
+        except Exception:
+            pass
+        # 性别识别：昵称区域颜色（男蓝/女红）
+        try:
+            import numpy as _np
+            rv = profile_pane.child_window(
+                auto_id="right_v_view.nickname_button_view", control_type="Group")
+            r = rv.rectangle()
+            crop = _np.array(pyautogui.screenshot().crop((r.left, r.top, r.right, r.bottom)))
+            if crop.size:
+                pix = crop.reshape(-1, 3)  # RGB
+                # 男蓝 RGB~[16,164,240]；女红 RGB~[187,61,61]
+                blue = ((pix[:, 2] > 150) & (pix[:, 0] < 80) &
+                        (pix[:, 1] > 80) & (pix[:, 1] < 200)).sum()
+                red = ((pix[:, 0] > 150) & (pix[:, 1] < 100) & (pix[:, 2] < 100)).sum()
+                if blue > 30:
+                    profile["性别"] = "男"
+                elif red > 30:
+                    profile["性别"] = "女"
+        except Exception as e:
+            emit("WARNING", f"[新好友] 性别识别失败: {e}")
+        return profile
 
     # ---- 微信事件转发 ----
     def on_wechat_message(self, chat: str, sender: str, content: str,
@@ -356,10 +408,9 @@ class MqttWorkerExtension:
         except Exception:
             is_new_friend = False
         if is_new_friend:
-            wxid = self._fetch_wxid_from_profile(chat)
-            if wxid:
-                sender_wxid = wxid
-                chat_wxid = wxid
+            # 异步查资料卡（耗时 UI 操作），不阻塞主消息转发；拿到微信号+性别后写缓存，下条消息生效
+            threading.Thread(target=self._fetch_wxid_from_profile, args=(chat,),
+                             daemon=True, name=f"profile-{chat[:8]}").start()
 
         # 二次核查自身账号
         if sender_wxid in (self._wx_id, self._wx_wechat_id):

@@ -239,6 +239,7 @@ class Monitor:
         self.check_interval = check_interval
         self._run_timeout = 30.0
         self._stop = threading.Event()
+        self._last_loop_alert = ("", 0.0)  # (异常文本, 时间戳)，节流防刷屏
         self.processed: set[str] = set()
         self.current_friend: Optional[str] = None
         self.current_last_rid = None
@@ -365,28 +366,18 @@ class Monitor:
                 return
             session_list.type_keys("{HOME}")
             time.sleep(0.2)
-            prev_last = None
-            for _ in range(10):  # 只扫会话列表前10条(最近的会话)
+            try:
+                items = session_list.children(control_type="ListItem")
+            except Exception:
+                items = []
+            for item in items[:10]:  # 只看会话列表前10个(最近的会话)
                 try:
-                    items = session_list.children(control_type="ListItem")
+                    wt = item.window_text() or ""
                 except Exception:
-                    break
-                for item in items:
-                    try:
-                        wt = item.window_text() or ""
-                    except Exception:
-                        continue
-                    for m in matches:
-                        if m not in hit and m in wt:
-                            hit.add(m)
-                if len(hit) >= len(matches):  # 全部命中,提前结束
-                    break
-                cur_last = items[-1].window_text() if items else ""
-                if cur_last == prev_last:  # 到底
-                    break
-                prev_last = cur_last
-                session_list.type_keys("{PGDN}")
-                time.sleep(0.15)
+                    continue
+                for m in matches:
+                    if m not in hit and m in wt:
+                        hit.add(m)
             session_list.type_keys("{HOME}")  # 复位
         except Exception as e:
             log.error(f"待通过好友扫描异常: {e}")
@@ -433,6 +424,29 @@ class Monitor:
             self.run_once()
         except Exception as e:
             log.error(f"主循环异常: {e}")
+            self._alert_loop_exception(e)
+
+    def _alert_loop_exception(self, e: Exception) -> None:
+        """主循环异常推飞书：夜间(23-6点)静默，同异常文本 1 小时内只推 1 次。"""
+        now = time.time()
+        # 夜间静默：23:00 ~ 次日 6:00 不推送
+        hour = time.localtime(now).tm_hour
+        if hour >= 23 or hour < 6:
+            return
+        msg = str(e)
+        last_msg, last_ts = self._last_loop_alert
+        if msg == last_msg and now - last_ts < 3600:
+            return  # 同异常 1 小时内已推过，跳过
+        self._last_loop_alert = (msg, now)
+        nickname = getattr(mqtt_worker, "_wx_nickname", "") or "未知"
+        try:
+            from . import webhook_send
+            webhook_send.send_webhook(
+                title=f"【{nickname}】微信机器人异常",
+                content=f"异常: {msg}\n时间: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            )
+        except Exception as we:
+            log.error(f"主循环异常 webhook 推送失败: {we}")
 
 
 # 全局单例

@@ -28,8 +28,9 @@ TASK_PRIORITY_MAP = {
     "wechat_message": 4,
     "get_chat_history": 5,
     "ping": 6,
+    "get_friend_moments": 7,  # 朋友圈按范围导出（慢操作，低优先级）
 }
-WINDOW_OPENING_TASKS = {"send_text", "get_chat_history", "get_friend_details"}
+WINDOW_OPENING_TASKS = {"send_text", "get_chat_history", "get_friend_details", "get_friend_moments"}
 
 
 def emit(level: str, message: str, role: str = "") -> None:
@@ -101,7 +102,8 @@ class MinioUploader:
             self._client = None
             return False
 
-    def upload(self, local_path: str, chat: str = "") -> str | None:
+    def upload_named(self, local_path: str, object_name: str) -> str | None:
+        """按指定 object_name 上传，返回可访问 URL；失败返回 None。URL 拼接复用 public_url_prefix/endpoint。"""
         if not self._ensure_client():
             return None
         try:
@@ -109,10 +111,6 @@ class MinioUploader:
             if not local.exists():
                 emit("ERROR", f"文件不存在: {local_path}")
                 return None
-            ext = local.suffix or ".bin"
-            ts = int(time.time())
-            short = uuid.uuid4().hex[:8]
-            object_name = f"chat-files/{chat}/{ts}_{short}{ext}" if chat else f"chat-files/{ts}_{short}{ext}"
             ct, _ = mimetypes.guess_type(str(local))
             self._client.fput_object(self._bucket, object_name, str(local),
                                      content_type=ct or "application/octet-stream")
@@ -126,3 +124,11 @@ class MinioUploader:
         except Exception as e:
             emit("ERROR", f"MinIO 上传失败: {e}")
             return None
+
+    def upload(self, local_path: str, chat: str = "") -> str | None:
+        """富媒体转发用：object key 前缀 chat-files/{chat}/..."""
+        ext = Path(local_path).suffix or ".bin"
+        ts = int(time.time())
+        short = uuid.uuid4().hex[:8]
+        object_name = f"chat-files/{chat}/{ts}_{short}{ext}" if chat else f"chat-files/{ts}_{short}{ext}"
+        return self.upload_named(local_path, object_name)

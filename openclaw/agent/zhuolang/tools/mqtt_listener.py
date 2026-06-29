@@ -216,6 +216,85 @@ def notify_agent(message_text, sender='', topic='', instance_id=None, context=No
     return True
 
 
+def handle_moments_result(topic, data):
+    """处理朋友圈查询回调（moments_task_result）— 按好友累积到 records/friend_moments/<好友>.json
+
+    定时巡检场景：文件保存该好友【完整的朋友圈列表】（累积、不覆盖）。
+    去重：
+      ① correlationId 幂等——同一查询的回调重复送达只处理一次；
+      ② 朋友圈条目按 发布日期+发布时间(+内容) 去重，保证列表不重复。
+    """
+    import re
+    instance_id = data.get('_instance_id') or _parse_instance_id_from_topic(topic)
+    result = data.get('result', {}) or {}
+    friend = data.get('targetName') or result.get('friend') or 'unknown'
+    safe_friend = re.sub(r'[\\/*?:"<>|]', '_', friend)
+    cid = data.get('correlationId', '')
+
+    out_dir = Path(__file__).parent.parent / 'records' / 'friend_moments'
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_file = out_dir / f'{safe_friend}.json'
+
+    # 读取已有记录，累积合并（不覆盖）
+    existing = {}
+    if out_file.exists():
+        try:
+            existing = json.loads(out_file.read_text(encoding='utf-8')) or {}
+        except Exception:
+            existing = {}
+    processed_cids = existing.get('processed_cids', []) or []
+    moments = existing.get('moments', []) or []
+
+    # ① correlationId 幂等：同一查询回调重复送达则跳过
+    if cid and cid in processed_cids:
+        log.info(f'朋友圈回调 cid={cid} 已处理过，跳过 ({friend})')
+        return
+
+    # ② 条目去重：发布日期|发布时间|内容前30 拼接 key
+    def _key(m):
+        return f"{m.get('发布日期', '')}|{m.get('发布时间', '')}|{(m.get('内容', '') or '')[:30]}"
+
+    seen = {_key(m) for m in moments if isinstance(m, dict)}
+    added = 0
+    for m in result.get('moments', []) or []:
+        if not isinstance(m, dict):
+            continue
+        k = _key(m)
+        if k not in seen:
+            seen.add(k)
+            moments.append(m)
+            added += 1
+
+    if cid:
+        processed_cids.append(cid)
+
+    record = {
+        'friend': friend,
+        'instance': instance_id,
+        'updated_at': datetime.now().isoformat(timespec='seconds'),
+        'count': len(moments),
+        'processed_cids': processed_cids,
+        'last_query': {
+            'correlationId': cid,
+            'status': data.get('status') or result.get('status', ''),
+            'range': result.get('range', {}),
+            'error': result.get('error', ''),
+            'executed_at': data.get('executedAt', ''),
+            'queried_at': datetime.now().isoformat(timespec='seconds'),
+            'source_wxid': data.get('senderId', ''),
+            'agentId': data.get('agentId', ''),
+            'role': data.get('role', ''),
+            'new_added': added,
+        },
+        'moments': moments,
+    }
+    try:
+        out_file.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding='utf-8')
+        log.info(f'朋友圈结果已合并写入 {out_file} (本次新增 {added} 条，共 {len(moments)} 条)')
+    except Exception as e:
+        log.error(f'朋友圈结果写入失败 {out_file}: {e}')
+
+
 def handle_wechat_message(topic, data):
     """处理微信消息回调 — 推送给 OpenClaw agent
     
@@ -224,6 +303,10 @@ def handle_wechat_message(topic, data):
     
     实例 ID 从 data['_instance_id'] 或 topic 解析
     """
+    # 朋友圈查询结果（异步落盘，不推 agent）
+    if data.get('event') == 'moments_task_result':
+        handle_moments_result(topic, data)
+        return
     # 从 data 或 topic 解析实例 ID
     instance_id = data.get('_instance_id') or _parse_instance_id_from_topic(topic)
 
