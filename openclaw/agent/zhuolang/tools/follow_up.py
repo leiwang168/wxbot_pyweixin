@@ -66,15 +66,6 @@ def main():
     if not validate(chat, message):
         sys.exit(1)
 
-    # context 中的 instanceId 是权威来源，覆盖 --instance
-    ctx_inst = context.get('instanceId', '')
-    if ctx_inst and ctx_inst != args.instance:
-        err_msg = f'实例不匹配: context.instanceId={ctx_inst} 但 --instance={args.instance}'
-        result = {'ok': False, 'error': err_msg, 'contact': chat, 'instance': args.instance}
-        if args.json:
-            print(json.dumps(result, ensure_ascii=False))
-        sys.exit(1)
-
     agent = ProcurementAgent(instance_id=args.instance)
     if not agent.connect():
         result = {'ok': False, 'error': 'MQTT连接失败'}
@@ -84,6 +75,15 @@ def main():
 
     # ping 检查跳过：Wbot 不回复 ping 事件，不代表离线
     # 直接尝试发消息，以 send_text 回调结果为准
+
+    # 检查实例一致性：context 中的 agentId/role 应与 --instance 匹配
+    ctx_instance = context.get('agentId', '')
+    if ctx_instance and ctx_instance != args.instance:
+        err_msg = f'实例不匹配: --instance={args.instance} 但上下文属于 {ctx_instance}'
+        result = {'ok': False, 'error': err_msg, 'contact': chat, 'instance': args.instance}
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False))
+        sys.exit(1)
 
     # 从上下文中提取 targetId/targetName 和 correlationId
     target_id = context.get('targetId', '')

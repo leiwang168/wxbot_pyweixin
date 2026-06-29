@@ -66,7 +66,7 @@ def t3_common_config():
 
     mqtt = get_mqtt_config()
     assert mqtt['broker'] == '192.168.10.101'
-    assert mqtt['port'] == 12403
+    assert mqtt['port'] == 1883
     assert mqtt['username'] == 'mqtt_client'
     print(f'     MQTT: {mqtt["broker"]}:{mqtt["port"]}')
 

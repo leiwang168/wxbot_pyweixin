@@ -164,7 +164,6 @@ def main():
 
         # 构建 context 传递信封字段
         ctx = {
-            'instanceId': args.instance,
             'targetId': target_id,
             'targetName': target_name,
         }

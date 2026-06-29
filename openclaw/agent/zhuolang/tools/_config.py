@@ -122,7 +122,7 @@ def get_mqtt_config():
     cfg = load_instances_config()
     return {
         'broker': cfg.get('broker', '192.168.10.101'),
-        'port': cfg.get('port', 12403),
+        'port': cfg.get('port', 1883),
         'username': cfg.get('username', ''),
         'password': cfg.get('password', ''),
         'connect_timeout': cfg.get('connect_timeout', 20),

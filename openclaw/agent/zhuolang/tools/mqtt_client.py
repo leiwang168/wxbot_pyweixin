@@ -15,12 +15,25 @@ from _config import (
     get_instance_outbound_topic, get_ca_cert_path, load_instances_config
 )
 
+
+def _classify_file_type(url: str) -> dict:
+    """根据文件URL/路径判断文件类型，返回 {'type': ..., 'text': ...}"""
+    ext = Path(url.split('?')[0].split('#')[0]).suffix.lower().lstrip('.')
+    # 图片
+    if ext in ('jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg', 'ico', 'tiff', 'tif', 'heic', 'heif', 'avif'):
+        return {'type': '图片', 'text': ''}
+    # 视频
+    if ext in ('mp4', 'mov', 'avi', 'mkv', 'wmv', 'flv', 'webm', 'mpeg', 'mpg', '3gp', 'ts', 'm4v'):
+        return {'type': '视频', 'text': ''}
+    # 其他（文档/压缩包/PDF等统一归为文件）
+    return {'type': '文件', 'text': ''}
+
 _mqtt_cfg = get_mqtt_config()
 _agent_cfg = get_agent_config()
 
 # MQTT 连接参数
 BROKER = _mqtt_cfg['broker']
-PORT = _mqtt_cfg.get('port', 12403)
+PORT = _mqtt_cfg.get('port', 1883)
 PORT_TLS = _mqtt_cfg.get('port_tls', 8883)
 USERNAME = _mqtt_cfg['username']
 PASSWORD = _mqtt_cfg['password']
@@ -233,11 +246,12 @@ class ProcurementAgent:
         if target_id_val != target_name_val:
             fields['targetId'] = target_id_val
 
-        # 仅发送文件时（无文字），Wbot 要求 text 为空字符串且 type='fileUrl'
+        # 仅发送文件时（无文字），根据文件类型设置 type
         # 有文字内容时 type='text'，Wbot 按文本+附件处理
         if file_url and not message.strip():
-            fields['type'] = 'fileUrl'
-            fields['text'] = ''
+            _ft = _classify_file_type(file_url)
+            fields['type'] = _ft['type']
+            fields['text'] = _ft['text']
         else:
             fields['type'] = 'text'
 

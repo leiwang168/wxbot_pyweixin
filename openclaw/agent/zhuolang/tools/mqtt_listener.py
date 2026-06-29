@@ -145,18 +145,13 @@ def notify_agent(message_text, sender='', topic='', instance_id=None, context=No
 
     msg = (
         f'【{sender or "未知"} 发来微信消息】{message_text}\n\n'
-        f'⚠️ 回复规则（严格遵守）：\n'
-        f'- 只能用 exec 执行: python tools/follow_up.py --chat "{sender or "未知"}" --message "你的回复内容" --instance {instance_id} --context "{context_str}"\n'
-        f'- 必须传递 --context 参数（base64编码），里面包含 targetId/targetName/role/selfWxName/selfWxId/agentId/ts 等信封字段，不传会导致 Wbot 回错人\n'
-        f'- 禁止省略 --context 参数\n'
-        f'- 禁止修改 --context 参数的值\n'
-        f'- 禁止创建任何临时 .py 文件\n'
-        f'- 禁止用 python -c 方式调用\n'
-        f'- 禁止用 write 工具写脚本文件\n'
-        f'- 禁止直接调用 mqtt_client.py\n'
-        f'- 像真人操作员一样简洁回复，不要AI腔\n'
-        f'- 不要暴露自己是AI\n'
-        f'- 不要泄露其他微信联系人报价'
+        f'⚠️ 收到消息必须回，回复规则（严格遵守）：\n'
+        f'- 回消息执行: python tools/follow_up.py --chat "{sender or "未知"}" --message "你的回复内容" --instance {instance_id} --context "{context_str}"\n'
+        f'- 参数必须传递 --context 参数（base64编码），里面包含 targetId/targetName/role/selfWxName/selfWxId/agentId/ts 等信封字段，不传会导致 Wbot 回错人\n'
+        f'- 参数必须传递 --instance 参数（wbot实例），不传会导致 Wbot 回错人\n'
+        f'- 禁止创建任何临时 .py 文件；禁止用 python -c 方式调用；禁止用 write 工具写脚本文件；禁止直接调用 mqtt_client.py\n'
+        f'- 像真人操作员一样简洁回复，不要AI腔；不要暴露自己是AI；不要泄露其他微信联系人报价\n'
+        f'- 不要泄露其他微信联系人的任何隐私信息'
     )
 
     # 用双引号包裹，内部双引号转义
@@ -164,7 +159,46 @@ def notify_agent(message_text, sender='', topic='', instance_id=None, context=No
     session_key_escaped = session_key.replace('"', '\\"')
 
     cmd = f'openclaw agent --session-key "{session_key_escaped}" --message "{msg_escaped}" --timeout 120'
-    log.info(f'推送 -> {session_key}: {message_text[:40]}...')
+    log.info(f'推送 -> {session_key}: {message_text[:100]}...')
+
+    sender = safe_sender
+    sender_id = context.get('senderId', '')
+    self_wx = context.get('selfWxName', '')  # 当前登录的微信名
+    inst_info = f"[{instance_id}|{self_wx}] " if self_wx else f"[{instance_id}] "    
+
+    ################# 检测微信好友通过验证消息 — 不走 AI，直接自动回复 + 飞书通知 begin ############################
+    if '我通过了你的朋友验证请求' in message_text:
+        log.info(f'{inst_info}检测到好友通过验证消息: sender={sender}, self_wx={self_wx}')
+        # 自动回复固定话术
+        reply = '老板好！咱是十万吨级精酿产能基地。酒厂直发，价格透明，感兴趣的话发个报价单对比下。'
+        cmd = f'PYTHONPATH=/home/node/.openclaw/workspace/zhuolang/python_deps:$PYTHONPATH python3 /home/node/.openclaw/workspace/zhuolang/tools/follow_up.py --chat "{sender or "未知"}" --message "{reply}" --instance {instance_id} --context "{context_str}"'
+        log.info(f'{inst_info}自动回复好友验证: {reply[:100]}...')
+        try:
+            subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30, encoding='utf-8')
+        except Exception as e:
+            log.error(f'{inst_info}自动回复失败: {e}')
+        
+        # 发飞书 webhook 通知
+        try:
+            import urllib.request
+            webhook_url = 'https://open.feishu.cn/open-apis/bot/v2/hook/ff8bbbb8-b238-4f06-b266-46754b238ce7'
+            display_name = self_wx or instance_id
+            contact_name = sender or '未知'
+            card_payload = {
+                'msg_type': 'text',
+                'content': {
+                    'text': f'【{display_name}】成功添加【{contact_name}】'
+                }
+            }
+            post_data = json.dumps(card_payload).encode('utf-8')
+            req = urllib.request.Request(webhook_url, data=post_data, headers={'Content-Type': 'application/json'})
+            urllib.request.urlopen(req, timeout=10)
+            log.info(f'{inst_info}飞书通知已发送: {contact_name}')
+        except Exception as e:
+            log.error(f'{inst_info}飞书通知发送失败: {e}')
+        
+        return True
+        ################# 检测微信好友通过验证消息 — 不走 AI，直接自动回复 + 飞书通知 end ############################
 
     def _run():
         try:
@@ -172,7 +206,7 @@ def notify_agent(message_text, sender='', topic='', instance_id=None, context=No
             if result.returncode != 0:
                 log.error(f'推送失败 (rc={result.returncode}): {result.stderr[:200]}')
             else:
-                log.info(f'推送完成: {session_key}')
+                pass  # 推送成功，无需额外处理
         except subprocess.TimeoutExpired:
             log.error(f'推送超时: {session_key}')
         except Exception as e:
@@ -247,17 +281,6 @@ def handle_wechat_message(topic, data):
 
         if msg_text:
             notify_agent(f"{msg_text}", sender=sender or '未知', topic=topic, instance_id=instance_id, context=context)
-        return
-
-    # 好友通过验证
-    if data.get('event') == 'friend_accepted':
-        nickname = data.get('nickname', '')
-        remark = data.get('remark', '')
-        sender = data.get('senderId', '')
-        inst_info = f"[{instance_id}] " if instance_id else ""
-        log.info(f'{inst_info}好友通过: {nickname}({remark}) sender={sender}')
-        msg_text = f'[系统] 好友已通过验证 — 昵称: {nickname}, 备注: {remark}, 微信名: {sender}'
-        notify_agent(msg_text, sender=sender or nickname or '新好友', topic=topic, instance_id=instance_id)
         return
 
     # 兼容旧格式 — 区分主动拉取记录回调 vs 真实新消息
@@ -470,7 +493,7 @@ class ProxyListenerClient:
             log.error(f'消息处理异常: {e}')
 
     def connect(self):
-        # 如果已有 client，先彻底清理
+        # 如果已有 client，先彻底清理（防止 client_id 冲突）
         if self.client:
             try:
                 self.client.loop_stop()
@@ -480,7 +503,9 @@ class ProxyListenerClient:
             self.client = None
         self.connected = False
 
-        self.client = self._mqtt_client.Client(client_id=f'{AGENT_NAME}-proxy', callback_api_version=self._mqtt_client.CallbackAPIVersion.VERSION2)
+        # 每次连接使用唯一 client_id，避免与旧残留 client 冲突
+        client_id = f'{AGENT_NAME}-proxy-{int(time.time() * 1000)}'
+        self.client = self._mqtt_client.Client(client_id=client_id, callback_api_version=self._mqtt_client.CallbackAPIVersion.VERSION2)
         self.client.username_pw_set(_mqtt_cfg['username'], _mqtt_cfg['password'])
 
         if self.use_tls:
@@ -491,13 +516,14 @@ class ProxyListenerClient:
                 log.warning('CA证书不存在，TLS可能失败')
                 self.client.tls_set()
 
-        # 增大 keepalive 到 120s，降低 broker 主动断开风险
-        KEEPALIVE = 120
+        # keepalive 60s，适配 broker 端约 90s 的超时
+        KEEPALIVE = 60
 
-        def _on_disconnect(c, u, rc, props=None, reasonCode=None):
+        def _on_disconnect(c, u, flags, reason_code, props=None):
+            # paho-mqtt v2 回调签名: (client, userdata, flags, reason_code, properties)
             if self.connected:
                 self.connected = False
-                log.warning(f'MQTT 连接断开 (rc={rc})')
+                log.warning(f'MQTT 连接断开 (reason_code={reason_code})')
         self.client.on_disconnect = _on_disconnect
         self.client.on_connect = self._on_connect
         self.client.on_message = self._on_message
@@ -507,6 +533,8 @@ class ProxyListenerClient:
             self.client.connect(_mqtt_cfg['broker'], port, KEEPALIVE)
         except Exception as e:
             log.error(f'MQTT connect 异常: {e}')
+            # connect 失败也要清理 client，防止 loop 线程泄漏
+            self.client = None
             return False
         self.client.loop_start()
         time.sleep(1.5)
@@ -514,14 +542,21 @@ class ProxyListenerClient:
 
     def disconnect(self):
         if self.client:
-            self.client.loop_stop()
-            self.client.disconnect()
+            try:
+                self.client.loop_stop()
+            except:
+                pass
+            try:
+                self.client.disconnect()
+            except:
+                pass
         self.client = None
+        self.connected = False
 
 
 def run_listener(instance_id=None):
     """启动 MQTT 监听（永不退出，一直重试直到连接上）
-    
+
     Args:
         instance_id: 可选，只监听指定实例。传 None 则监听所有已启用实例。
     """
@@ -541,8 +576,19 @@ def run_listener(instance_id=None):
         target_instances = _enabled_instances
         target_topics = CALLBACK_TOPICS
 
+    # 用于 finally 清理，防止 client 泄漏
+    proxy_client = None
+
     while True:
         try:
+            # 创建新的 proxy client 之前，先彻底销毁旧实例（防止 client_id 冲突和线程泄漏）
+            if proxy_client:
+                try:
+                    proxy_client.disconnect()
+                except Exception as e:
+                    log.warning(f'清理旧客户端异常: {e}')
+                proxy_client = None
+
             proxy_client = ProxyListenerClient(
                 target_topics=target_topics,
                 target_instances=target_instances,
@@ -555,12 +601,18 @@ def run_listener(instance_id=None):
                 if not proxy_client.connect():
                     delay = _retry_intervals[min(_retry_idx, len(_retry_intervals)-1)]
                     log.warning(f'MQTT连接失败，{delay}s后重试...')
+                    # 失败后清理当前 client，下次循环会重新创建
+                    try:
+                        proxy_client.disconnect()
+                    except:
+                        pass
                     time.sleep(delay)
                     _retry_idx += 1
                     continue
 
-            # 创建 AgentClass 实例（用于发送小程序回复等）
-            agent = AgentClass(instance_id=target_instances[0]['id'], client_id=f'{AGENT_NAME}-sender', use_tls=False)
+            # 创建 AgentClass 实例（用于发送小程序回复等），使用唯一 client_id
+            sender_id = f'{AGENT_NAME}-sender-{int(time.time())}'
+            agent = AgentClass(instance_id=target_instances[0]['id'], client_id=sender_id, use_tls=False)
             if not agent.connected:
                 agent.connect()
 
@@ -573,13 +625,16 @@ def run_listener(instance_id=None):
                 time.sleep(5)
                 if not proxy_client.connected:
                     log.warning('MQTT连接断开，重新连接...')
+                    # 必须先清理 proxy_client，否则旧的 loop 线程残留会导致 client_id 冲突
+                    try:
+                        proxy_client.disconnect()
+                    except Exception as e:
+                        log.warning(f'断开 proxy_client 异常: {e}')
                     try:
                         agent.disconnect()
                     except:
                         pass
-                    agent = AgentClass(instance_id=target_instances[0]['id'], client_id=f'{AGENT_NAME}-sender', use_tls=False)
-                    if not agent.connected:
-                        agent.connect()
+                    agent = None
                     break
 
         except KeyboardInterrupt:
@@ -588,13 +643,26 @@ def run_listener(instance_id=None):
         except Exception as e:
             delay = _retry_intervals[min(_retry_idx, len(_retry_intervals)-1)]
             log.error(f'监听异常: {e}，{delay}s后重试...')
+            # 异常后清理，避免带着脏状态重试
+            if proxy_client:
+                try:
+                    proxy_client.disconnect()
+                except:
+                    pass
             time.sleep(delay)
             _retry_idx += 1
 
+    # 最终清理
     if agent:
-        agent.disconnect()
-    if 'proxy_client' in locals():
-        proxy_client.disconnect()
+        try:
+            agent.disconnect()
+        except:
+            pass
+    if proxy_client:
+        try:
+            proxy_client.disconnect()
+        except:
+            pass
 
 
 _PID_FILE = None  # 全局变量，用于存储 pid 文件路径
