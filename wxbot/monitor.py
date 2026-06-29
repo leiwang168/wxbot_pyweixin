@@ -299,20 +299,30 @@ class Monitor:
                     if self.current_last_rid is None:
                         self.current_last_rid = last_rid
                     elif last_rid != self.current_last_rid:
+                        # 在当前聊天列表里定位旧基线 runtime_id
                         new_items = []
+                        base_found = False
                         for idx, it in enumerate(items):
                             if it.element_info.runtime_id == self.current_last_rid:
                                 new_items = items[idx + 1:]
+                                base_found = True
                                 break
-                        if not new_items:
-                            new_items = [items[-1]]
-                        for item in new_items:
-                            msg_text, msg_type, file_path = classify_message(item)
-                            _process_one(main_window, self.current_friend,
-                                         self.current_friend, msg_text, msg_type,
-                                         self.current_friend, self.processed, file_path=file_path)
-                        items2 = chat_list.children(control_type="ListItem")
-                        self.current_last_rid = items2[-1].element_info.runtime_id if items2 else last_rid
+                        if not base_found:
+                            # 旧基线不在当前聊天列表 → 当前停留会话已不是 current_friend
+                            # (用户手动切换了聊天窗口，或 runtime_id 失效)。
+                            # 此时绝不能把新会话的历史消息当新消息转发——重置基线并暂停 ①，
+                            # 等待 ② 红点机制重新锁定会话。
+                            log.info("[监听] 当前会话与记录的不一致(疑似切换聊天窗口)，重置基线，暂停当前会话轮询")
+                            self.current_friend = None
+                            self.current_last_rid = None
+                        else:
+                            for item in new_items:
+                                msg_text, msg_type, file_path = classify_message(item)
+                                _process_one(main_window, self.current_friend,
+                                             self.current_friend, msg_text, msg_type,
+                                             self.current_friend, self.processed, file_path=file_path)
+                            items2 = chat_list.children(control_type="ListItem")
+                            self.current_last_rid = items2[-1].element_info.runtime_id if items2 else last_rid
 
         # ② 扫描带未读红点的会话
         new_num = get_new_message_num(main_window, close_weixin=False)

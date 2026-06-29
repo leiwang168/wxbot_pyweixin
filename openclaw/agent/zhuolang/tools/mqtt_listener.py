@@ -150,6 +150,7 @@ def notify_agent(message_text, sender='', topic='', instance_id=None, context=No
         f'- 参数必须传递 --context 参数（base64编码），里面包含 targetId/targetName/role/selfWxName/selfWxId/agentId/ts 等信封字段，不传会导致 Wbot 回错人\n'
         f'- 参数必须传递 --instance 参数（wbot实例），不传会导致 Wbot 回错人\n'
         f'- 禁止创建任何临时 .py 文件；禁止用 python -c 方式调用；禁止用 write 工具写脚本文件；禁止直接调用 mqtt_client.py\n'
+        f'- 重点强调：1、不能给用户发重复消息，发消息前先ping通；2、发给你用户消息先输出，在调用工具发送出去；\n'
         f'- 像真人操作员一样简洁回复，不要AI腔；不要暴露自己是AI；不要泄露其他微信联系人报价\n'
         f'- 不要泄露其他微信联系人的任何隐私信息'
     )
