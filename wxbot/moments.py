@@ -9,11 +9,36 @@ from __future__ import annotations
 import random
 import threading
 import time
+from contextlib import contextmanager
 
 from pyweixin import Moments
 
 from .config import bot_config
 from .logger import log
+
+
+@contextmanager
+def _ui_lock():
+    """获取全局 UI 锁（与 monitor / MQTT 任务 / 点赞循环互斥）。
+
+    发朋友圈、点赞都是耗时 UI 操作；持锁期间其他轮询（monitor 消息轮询、点赞循环）
+    让位，避免抢鼠标 / 页面状态冲突。锁不可用（MQTT 未启用）时不阻塞，仅记录。
+    """
+    from .mqtt.worker import mqtt_worker
+    lock = mqtt_worker.ui_lock
+    acquired = False
+    if lock:
+        acquired = lock.acquire(timeout=30)
+        if not acquired:
+            log.warning("[朋友圈] UI 锁获取超时(30s)，仍继续执行")
+    try:
+        yield
+    finally:
+        if acquired:
+            try:
+                lock.release()
+            except RuntimeError:
+                pass
 
 
 def post(text: str = "", images: list[str] | None = None) -> bool:
@@ -23,11 +48,12 @@ def post(text: str = "", images: list[str] | None = None) -> bool:
         log.warning("[朋友圈] 文字和图片均为空，跳过发布")
         return False
     try:
-        Moments.post_moments(
-            text=text or "",
-            medias=images,
-            close_weixin=False,
-        )
+        with _ui_lock():
+            Moments.post_moments(
+                text=text or "",
+                medias=images,
+                close_weixin=False,
+            )
         log.info(f"[朋友圈] 已发布: text={text!r}, images={len(images)} 张")
         return True
     except Exception as e:
@@ -38,7 +64,8 @@ def post(text: str = "", images: list[str] | None = None) -> bool:
 def like_once() -> None:
     """给今天的第一条朋友圈点赞（活跃账号）。"""
     try:
-        Moments.like_posts(recent="Today", number=1, close_weixin=False)
+        with _ui_lock():
+            Moments.like_posts(recent="Today", number=1, close_weixin=False)
         log.info("[朋友圈点赞] 已对今日朋友圈点赞")
     except Exception as e:
         log.error(f"[朋友圈点赞] 失败: {e}")

@@ -91,6 +91,17 @@ def main() -> int:
     else:
         log.info("MQTT 数字员工通道未启用（config.mqtt_worker.enabled=false）")
 
+    # 人工操作屏蔽（默认关闭；enabled 时屏蔽对微信窗口的鼠标点击，把微信交给机器人）
+    _ib = bot_config.get("input_block", {}) or {}
+    if _ib.get("enabled"):
+        from wxbot.input_blocker import input_blocker
+        input_blocker.configure(auto_release_minutes=_ib.get("auto_release_minutes", 30))
+        input_blocker.start()
+        input_blocker.enable(reason="服务启动")
+        log.info("🛡 人工操作屏蔽已启用（Ctrl+Alt+X 或 /解除屏蔽 解除）")
+    else:
+        log.info("人工操作屏蔽未启用（config.input_block.enabled=false）")
+
     # 启动调度器（定时消息/朋友圈/新好友/点赞，后台线程）
     scheduler.start()
 

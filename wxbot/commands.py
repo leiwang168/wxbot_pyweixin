@@ -29,6 +29,7 @@ from typing import Optional
 from . import moments
 from . import persona, employee, customer
 from .config import bot_config
+from .input_blocker import input_blocker
 from .logger import log
 from .reply import reply_engine
 
@@ -183,6 +184,12 @@ def handle(text: str) -> Optional[str]:
             friend_add_ext.initialize()
         return friend_add_ext.handle_admin_command(text)
 
+    # ---- 人工操作屏蔽 ----
+    if c == "屏蔽微信":
+        return input_blocker.enable(reason="admin 指令")
+    if c == "解除屏蔽":
+        return input_blocker.disable(reason="admin 指令")
+
     if c == "重载配置":
         bot_config.reload()
         reply_engine.reload_memory_settings()
@@ -273,7 +280,8 @@ def _status() -> str:
         f"  自定义转发: {c['custom_forward_switch']}\n"
         f"  数字员工: {c['digital_employee_switch']} | 默认岗位: {c['default_persona']}\n"
         f"  知识库: {c['knowledge_switch']} | 转人工: {c['escalation_switch']}\n"
-        f"  AI接口数: {len(c['api_configs'])} (当前#{c['api_index']})"
+        f"  AI接口数: {len(c['api_configs'])} (当前#{c['api_index']})\n"
+        f"  人工屏蔽: {input_blocker.status() if input_blocker._started else '未启动'}"
     )
 
 
@@ -300,5 +308,7 @@ def _help() -> str:
         "/添加好友 微信号或wxid\n"
         "— 记忆与配置 —\n"
         "/记忆列表 | /清空记忆 窗口名 | /清空全部记忆\n"
-        "/重载配置"
+        "/重载配置\n"
+        "— 人工屏蔽 —\n"
+        "/屏蔽微信 | /解除屏蔽（或 Ctrl+Alt+X）"
     )

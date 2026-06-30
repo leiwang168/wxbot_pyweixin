@@ -33,6 +33,7 @@ from pyweixin import Messages, Files, FriendSettings, Contacts, Moments, Navigat
 from pyweixin.Uielements import Main_window, SideBar
 
 from ..config import bot_config
+from ..input_blocker import input_blocker
 from .common import (MAX_CONTACT_LEN, MAX_HISTORY_LIMIT, MAX_MESSAGE_LEN,
                      MAX_TARGET_LEN, MAX_VERIFY_TEXT_LEN, emit)
 from .resolver import ContactResolver
@@ -69,9 +70,11 @@ class TaskExecutor:
             self._log("WARNING", f"UI 窗口重置失败，后续操作可能受影响: {e}")
         if self._wx_busy_event:
             self._wx_busy_event.set()
+        input_blocker.set_bot_active(True)  # 放行机器人点击
 
     def _exit_ui(self) -> None:
         """释放 UI 锁，标记退出 UI 操作。"""
+        input_blocker.set_bot_active(False)
         if self._wx_busy_event:
             self._wx_busy_event.clear()
         if self._ui_lock:
@@ -418,6 +421,7 @@ class TaskExecutor:
             return {"status": "error", "error": "text 和 media_files 至少需要提供一项"}
 
         local_media: list[str] = []
+        failed_urls: list[str] = []
         if media_urls:
             if not isinstance(media_urls, list):
                 return {"status": "error", "error": "media_files 必须为字符串数组"}
@@ -427,14 +431,28 @@ class TaskExecutor:
                 if not isinstance(url, str) or not url.strip():
                     continue
                 local = self.download_file(url.strip())
-                if not local:
-                    return {"status": "error", "error": f"媒体文件下载失败: {url[:100]}"}
-                local_media.append(str(local))
+                if local:
+                    local_media.append(str(local))
+                else:
+                    failed_urls.append(url[:100])
+        # 配图资源不可用 → 降级：全部失败且有文字则纯文字发；全部失败且无文字才报错
+        if failed_urls and not local_media:
+            if text:
+                self._log("WARNING", f"配图全部下载失败，降级纯文字发布: {failed_urls}")
+            else:
+                return {"status": "error", "error": f"配图下载失败且无文字内容: {failed_urls}"}
+        elif failed_urls:
+            self._log("WARNING", f"部分配图下载失败已跳过: {failed_urls}")
 
         if privacy != "public" or tags:
             self._log("WARNING", "pyweixin post_moments 暂不支持隐私/标签，按公开发布（已知 gap）")
         try:
-            Moments.post_moments(text=text, medias=local_media, close_weixin=False)
+            # 发朋友圈是耗时高优操作：持 UI 锁独占，期间 monitor 轮询与点赞/加好友等让位
+            self._enter_ui()
+            try:
+                Moments.post_moments(text=text, medias=local_media, close_weixin=False)
+            finally:
+                self._exit_ui()
         except Exception as e:
             return {"status": "error", "error": str(e)}
         self._log("INFO", f"朋友圈已发布 文案{len(text)}字 媒体{len(local_media)}个")

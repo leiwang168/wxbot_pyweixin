@@ -144,8 +144,8 @@ def dump_friend_moments_range(friend: str, start, end, uploader,
             try:
                 detail_rect = sns_detail_list.rectangle()
                 full = pyautogui.screenshot()
-                full.crop((detail_rect.left - 20, detail_rect.top,
-                           detail_rect.right - 50, detail_rect.bottom)).save(tmp_path)
+                full.crop((detail_rect.left, detail_rect.top,
+                           detail_rect.right, detail_rect.bottom)).save(tmp_path)
                 if uploader and getattr(uploader, 'available', False):
                     url = uploader.upload_named(tmp_path, object_key) or ""
                 else:

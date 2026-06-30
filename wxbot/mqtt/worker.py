@@ -20,6 +20,7 @@ from pyweixin.WeChatTools import Navigator, desktop, mouse
 from pyweixin.Uielements import Windows
 
 from ..config import bot_config
+from ..input_blocker import input_blocker
 from .adapter import MqttAdapter
 from .common import MinioUploader, emit
 from .coordinator import MqttCoordinator
@@ -207,9 +208,11 @@ class MqttWorkerExtension:
                 emit("WARNING", "UI 锁获取超时 (30s)，媒体保存跳过")
                 raise RuntimeError("UI lock acquire timeout")
             self._coordinator._wx_busy_event.set()
+            input_blocker.set_bot_active(True)  # 放行机器人点击
 
     def _exit_ui(self) -> None:
         """释放 UI 锁，标记退出 UI 操作。"""
+        input_blocker.set_bot_active(False)
         if self._coordinator:
             self._coordinator._wx_busy_event.clear()
             try:

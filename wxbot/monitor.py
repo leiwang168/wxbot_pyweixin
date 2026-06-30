@@ -26,6 +26,7 @@ from pyweixin.WinSettings import SystemSettings
 from . import commands
 from .config import bot_config
 from .logger import log
+from .input_blocker import input_blocker
 from .mqtt.worker import mqtt_worker
 from .reply import reply_engine, is_listened_chat, match_forward, human_delay, split_long_text
 
@@ -255,9 +256,11 @@ class Monitor:
         if ui_lock and not ui_lock.acquire(timeout=0.5):
             log.info("UI 锁被占用，跳过本轮消息轮询")
             return
+        input_blocker.set_bot_active(True)  # 放行机器人点击
         try:
             self._run_once_locked()
         finally:
+            input_blocker.set_bot_active(False)
             if ui_lock:
                 try:
                     ui_lock.release()

@@ -146,6 +146,11 @@ DEFAULTS: dict[str, Any] = {
             }
         ],
     },
+    # ---- 人工操作屏蔽（服务运行时把微信交给机器人）----
+    "input_block": {
+        "enabled": False,               # 默认关闭；服务专用机置 true
+        "auto_release_minutes": 30,     # 连续屏蔽 N 分钟自动解除（防遗忘兜底）
+    },
 }
 
 
