@@ -104,39 +104,62 @@ class _FriendAddService:
         retry_count = int(self._cfg.get("retry_count", 3))
         last_result = None
 
-        for attempt in range(1 + retry_count):
-            if attempt > 0:
-                delay = min(2 ** attempt, 32)
-                self._log("WARNING", f"[好友添加] 第{attempt}次重试 target={target}，等待{delay}s")
-                time.sleep(delay)
+        # 加好友是耗时 UI 操作：持 UI 锁独占，期间 monitor/点赞/其他任务让位，不抢鼠标
+        from .mqtt.worker import mqtt_worker
+        from .input_blocker import input_blocker
+        ui_lock = mqtt_worker.ui_lock
+        _acquired = False
+        if ui_lock:
+            _acquired = ui_lock.acquire(timeout=30)
+            if not _acquired:
+                self._log("WARNING", "[好友添加] UI 锁获取超时(30s)，仍继续执行")
+        input_blocker.set_bot_active(True)
+        try:
+            pre_delay = int(bot_config.get("friend_add", {}).get("pre_delay", 1) or 0)
+            if pre_delay > 0:
+                self._log("INFO", f"加好友前等待 {pre_delay}s（拟人延迟）")
+                time.sleep(pre_delay)
 
-            result = self._adapter.add_new_friend(target, verify_text or "", remark or "")
-            if result["status"] == "sent":
-                with self._lock:
-                    self._last_add[target] = time.time()
-                    self._today_count += 1
-                self._log("SUCCESS", f"[好友添加] 申请已发送: target={target}")
-                return {"status": "sent", "reason": "ok", "target": target,
-                        "source": source, "ts": time.time(),
-                        "nickname": result.get("nickname", target),
-                        "remark": remark}
+            for attempt in range(1 + retry_count):
+                if attempt > 0:
+                    delay = min(2 ** attempt, 32)
+                    self._log("WARNING", f"[好友添加] 第{attempt}次重试 target={target}，等待{delay}s")
+                    time.sleep(delay)
 
-            last_result = result
-            self._log("WARNING",
-                      f"[好友添加] 失败(target={target}, attempt={attempt}): {result.get('raw', 'unknown')}")
+                result = self._adapter.add_new_friend(target, verify_text or "", remark or "")
+                if result["status"] == "sent":
+                    with self._lock:
+                        self._last_add[target] = time.time()
+                        self._today_count += 1
+                    self._log("SUCCESS", f"[好友添加] 申请已发送: target={target}")
+                    return {"status": "sent", "reason": "ok", "target": target,
+                            "source": source, "ts": time.time(),
+                            "nickname": result.get("nickname", target),
+                            "remark": remark}
 
-        self._log("ERROR", f"[好友添加] 最终失败: target={target} err={last_result.get('raw', 'unknown')}")
-        if self._notify:
-            try:
-                self._notify(
-                    f"好友添加最终失败 - {target}",
-                    f"目标: {target}\n来源: {source}\n原因: {last_result.get('raw', '')}",
-                )
-            except Exception:
-                pass
+                last_result = result
+                self._log("WARNING",
+                          f"[好友添加] 失败(target={target}, attempt={attempt}): {result.get('raw', 'unknown')}")
 
-        return {"status": "failed", "reason": last_result.get("raw", "unknown"),
-                "target": target, "source": source, "ts": time.time()}
+            self._log("ERROR", f"[好友添加] 最终失败: target={target} err={last_result.get('raw', 'unknown')}")
+            if self._notify:
+                try:
+                    self._notify(
+                        f"好友添加最终失败 - {target}",
+                        f"目标: {target}\n来源: {source}\n原因: {last_result.get('raw', '')}",
+                    )
+                except Exception:
+                    pass
+
+            return {"status": "failed", "reason": last_result.get("raw", "unknown"),
+                    "target": target, "source": source, "ts": time.time()}
+        finally:
+            input_blocker.set_bot_active(False)
+            if _acquired:
+                try:
+                    ui_lock.release()
+                except RuntimeError:
+                    pass
 
     def get_status(self) -> dict:
         with self._lock:

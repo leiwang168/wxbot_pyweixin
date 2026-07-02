@@ -11,3 +11,4 @@ config/contacts_cache - 副本.json
 config/pending_friends.json
 wxbot_*.log
 *.png
+/config/webhook.json

@@ -142,6 +142,8 @@ class ContactResolver:
                 if not isinstance(f, dict):
                     continue
                 norm = self._normalize(f)
+                if '已停用' in (norm.get('昵称') or ''):
+                    continue  # 跳过已停用账号（脏数据）
                 w = self._get_wxid(norm)
                 if w:
                     wl = w.lower()
@@ -272,6 +274,8 @@ class ContactResolver:
                 if not isinstance(item, dict):
                     continue
                 norm = self._normalize(item)
+                if '已停用' in (norm.get('昵称') or ''):
+                    continue  # 跳过已停用账号（脏数据）
                 w = self._get_wxid(norm)
                 if w:
                     wl = w.lower()

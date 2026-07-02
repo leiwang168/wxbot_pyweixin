@@ -273,6 +273,16 @@ class MqttCoordinator:
                 except Exception:
                     pass
                 self._task_pool = ThreadPoolExecutor(max_workers=2)
+                # 卡死的任务线程（如 dump 朋友圈遍历 COM 卡死）无法强杀，其 finally 里的
+                # win32 关窗在废弃线程里会失效（EnumWindows 枚举不到窗口）；
+                # 在此健康线程主动用 win32 强关残留的朋友圈窗口
+                try:
+                    from ..moments_export import _force_close_sns_window
+                    _n = _force_close_sns_window()
+                    if _n > 0:
+                        emit("INFO", f"任务超时后 win32 关闭 {_n} 个朋友圈窗口")
+                except Exception as _e:
+                    emit("WARNING", f"超时后 win32 关窗失败: {_e}")
             except Exception as e:
                 result = {"correlationId": cid, "status": "error",
                           "result": {"error": f"任务执行异常: {e}"}}

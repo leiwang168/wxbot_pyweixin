@@ -46,6 +46,9 @@ DEFAULTS: dict[str, Any] = {
     # 自定义转发（阶段一骨架）
     "custom_forward_switch": False,
     "custom_forward_list": [],
+    # 群消息关键词监控（命中 → 点头像读真实发送人 → 转发，独立于监听白名单）
+    "group_monitor_switch": False,
+    "group_monitor_list": [],  # [{"group":"群名","keywords":["车找人"],"forward_to":["文件传输助手"]}]
     # 新好友
     "new_friend_switch": False,
     "new_friend_reply_switch": False,
@@ -105,7 +108,9 @@ DEFAULTS: dict[str, Any] = {
         "rate_limit_seconds": 60,     # 同一目标限流间隔
         "daily_limit": 20,            # 每日添加上限
         "retry_count": 3,             # 失败重试次数
+        "pre_delay": 3,               # 加好友 UI 操作前延迟（秒），拟人化避免风控
     },
+    "moments_post_pre_delay": 3,      # 发朋友圈 UI 操作前延迟（秒），拟人化避免风控
     # ---- MQTT 数字员工（OpenClaw 通道）----
     "mqtt_worker": {
         "enabled": False,             # 默认关闭，需配合 MQTT broker 与 OpenClaw
@@ -117,7 +122,7 @@ DEFAULTS: dict[str, Any] = {
             "vhost": "/",
             "tls": False,
         },
-        "task_timeout": 60,
+        "task_timeout": 10,
         "close_chat_window": True,
         "close_chat_window_delay": 1.0,
         "skip_local_reply_when_forwarded": True,  # 转发到上游后跳过本地 AI 回复
@@ -196,7 +201,7 @@ def _normalize(raw: dict[str, Any]) -> dict[str, Any]:
     # 列表/字典类型兜底
     for k in ("listen_list", "group", "new_friend_msg", "new_friend_tags",
               "scheduled_msg_list", "random_msg_list", "scheduled_moments_list",
-              "random_moments_list", "custom_forward_list", "api_configs"):
+              "random_moments_list", "custom_forward_list", "group_monitor_list", "api_configs"):
         if not isinstance(cfg.get(k), list):
             cfg[k] = []
     for k in ("keyword_dict", "chat_persona_map", "group_persona_map"):

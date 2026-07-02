@@ -45,6 +45,43 @@ def _parse_date_boundary(s: str, end_of_day: bool = False):
     return dt.replace(hour=0, minute=0, second=0)
 
 
+def _force_close_sns_window() -> int:
+    """pywinauto close() 在 COM 异常下会失败,改用 win32 按 class_name/title 强关朋友圈窗口。
+
+    win32 不经 UIA COM,COM 异常下仍可关闭。匹配 class 含 SNS 或标题为 朋友圈/Moments。
+    始终打印扫描到的 mmui:: 顶层窗口,便于定位朋友圈窗口真实标识(诊断用)。
+    """
+    import win32gui
+    import win32con
+    targets = []
+    mmui_tops = []
+
+    def _cb(hwnd, _):
+        try:
+            if not win32gui.IsWindowVisible(hwnd):
+                return
+            cls = win32gui.GetClassName(hwnd) or ''
+            title = win32gui.GetWindowText(hwnd) or ''
+            if cls.startswith('mmui::'):
+                mmui_tops.append(cls)
+            if ('SNS' in cls) or (title in ('朋友圈', 'Moments')):
+                targets.append(hwnd)
+        except Exception:
+            pass
+
+    try:
+        win32gui.EnumWindows(_cb, None)
+    except Exception as e:
+        emit("WARNING", f"[Moments] EnumWindows 异常: {e}")
+    for hwnd in targets:
+        try:
+            win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+        except Exception:
+            pass
+    emit("INFO", f"[Moments] win32 扫描 mmui顶层={mmui_tops} 命中SNS={len(targets)}")
+    return len(targets)
+
+
 def dump_friend_moments_range(friend: str, start, end, uploader,
                               limit: int = 50, log_func=emit) -> list[dict]:
     """遍历好友朋友圈（按时间倒序），只保留发布时间落在 [start, end] 闭区间的条目。
@@ -88,22 +125,23 @@ def dump_friend_moments_range(friend: str, start, end, uploader,
         content = re.sub(r'^\s+', '', content)
         return content, photo_num, video_num, post_time
 
-    GlobalConfig.close_weixin = False
-    moments_window = Navigator.open_friend_moments(
-        friend=friend, is_maximize=False, close_weixin=False, search_pages=5)
-    backbutton = moments_window.child_window(**Buttons.BackButton)
-    Tools.cancel_pin(moments_window)
-    moments_list = moments_window.child_window(**Lists.MomentsList)
-    sns_detail_list = moments_window.child_window(**Lists.SnsDetailList)
-    moments_list.type_keys('{END}')
-    moments_list.type_keys('{HOME}')
-    time.sleep(1)
-
     posts = []
-    recorded = 0
-    used_date_keys = set()  # 同批次已用发布日期，同日多条第二条起切 _时分
-
+    moments_window = None
     try:
+        GlobalConfig.close_weixin = False
+        moments_window = Navigator.open_friend_moments(
+            friend=friend, is_maximize=False, close_weixin=False, search_pages=5)
+        backbutton = moments_window.child_window(**Buttons.BackButton)
+        Tools.cancel_pin(moments_window)
+        moments_list = moments_window.child_window(**Lists.MomentsList)
+        sns_detail_list = moments_window.child_window(**Lists.SnsDetailList)
+        moments_list.type_keys('{END}')
+        moments_list.type_keys('{HOME}')
+        time.sleep(1)
+
+        recorded = 0
+        used_date_keys = set()  # 同批次已用发布日期，同日多条第二条起切 _时分
+
         while recorded < limit:
             moments_list.type_keys('{DOWN}')
             selected = [li for li in moments_list.children(control_type='ListItem') if li.has_keyboard_focus()]
@@ -170,10 +208,18 @@ def dump_friend_moments_range(friend: str, start, end, uploader,
             if Tools.is_sns_at_bottom(moments_list, selected[0]):
                 log("INFO", "[Moments] 已到朋友圈底部")
                 break
+    except Exception as e:
+        # 获取朋友圈内容异常（打不开/控件缺失/解析失败等）：直接返回 None（无法查看），不再继续，不抛给上层
+        log("ERROR", f"[Moments] 获取 {friend} 朋友圈内容异常，无法查看: {e}")
+        return None
     finally:
-        try:
-            moments_window.close()
-        except Exception:
-            pass  # 关闭失败不影响已获取内容
+        if moments_window is not None:
+            try:
+                moments_window.close()
+            except Exception as ce:
+                log("WARNING", f"[Moments] close() 失败(COM 异常?): {ce}")
+        # 兜底:COM 异常下 close() 可能失败或静默无效,用 win32 确保朋友圈窗口关闭
+        if _force_close_sns_window() > 0:
+            log("INFO", "[Moments] win32 兜底关闭朋友圈窗口")
 
     return posts

@@ -49,6 +49,10 @@ def post(text: str = "", images: list[str] | None = None) -> bool:
         return False
     try:
         with _ui_lock():
+            pre_delay = int(bot_config.get("moments_post_pre_delay", 3) or 0)
+            if pre_delay > 0:
+                log.info(f"[朋友圈] 发圈前等待 {pre_delay}s（拟人延迟）")
+                time.sleep(pre_delay)
             Moments.post_moments(
                 text=text or "",
                 medias=images,

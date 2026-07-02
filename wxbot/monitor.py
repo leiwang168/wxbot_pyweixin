@@ -100,7 +100,7 @@ def _find_and_click_session(session_list, friend, max_pages: int = 60) -> bool:
     return False
 
 
-def read_chat_messages(main_window, number: int = 5) -> list[tuple[str, str, str]]:
+def read_chat_messages(main_window, number: int = 5) -> list[tuple]:
     chat_list = main_window.child_window(**Lists.FriendChatList)
     if not chat_list.exists(timeout=1):
         return []
@@ -119,19 +119,60 @@ def read_chat_messages(main_window, number: int = 5) -> list[tuple[str, str, str
             if next_mtype == "文本" and next_display:
                 display = f"{display} | 转文字: {next_display}"
                 i += 1  # 跳过下一条（已合并）
-        out.append((display, mtype, mpath))
+        out.append((display, mtype, mpath, item))
         i += 1
     return out
+
+
+def _is_self_message(item, main_window) -> bool:
+    """自己（机器人）发的消息气泡靠右、对方靠左。
+
+    ListItem 的 UIA rect 是整行（自己/对方 rect/class/auto_id 完全相同，且无子元素），
+    无法用 rect/属性区分方向。只能截图判断：裁出 ListItem 区域，背景=该区域最常见颜色，
+    中间行里非背景像素（=气泡+文字+头像）的水平中心 > 区域中线 → 自己（右），否则对方（左）。
+    系统消息（时间戳）非背景像素极少，返回 False（不当自己），且 _process_one 已先过滤。
+    """
+    try:
+        import numpy as np
+        r = item.rectangle()
+        crop = np.array(pyautogui.screenshot().crop((r.left, r.top, r.right, r.bottom)))
+        if crop.size == 0:
+            return False
+        h, w = crop.shape[:2]
+        # 背景 = 区域最常见颜色（背景面积大于气泡）；下采样加速
+        small = crop[::4, ::4]
+        colors, counts = np.unique(small.reshape(-1, small.shape[-1]), axis=0, return_counts=True)
+        bg = colors[counts.argmax()].astype(int)
+        # 只看左右边缘窄带（头像所在侧），排除中部气泡干扰
+        # （图片消息气泡很大、会污染"左右半"判断，导致对方图片误判为自已）
+        diff_all = np.abs(crop.astype(int) - bg).sum(axis=2)
+        edge = max(40, w // 10)
+        left_n = int((diff_all[:, :edge] > 40).sum())
+        right_n = int((diff_all[:, -edge:] > 40).sum())
+        txt = (item.window_text() or '').replace('\n', ' ')[:20]
+        total = left_n + right_n
+        if total < 20:
+            log.info(f"[消息判断] {txt!r} 非背景像素={total} 判=对方(像素少)")
+            return False  # 几乎纯背景（时间戳/空行），不当自己
+        is_self = right_n > left_n  # 头像/内容在右 → 自己
+        log.info(f"[消息判断] {txt!r} bg={bg.tolist()} 左非背景={left_n} 右非背景={right_n} 判={'自己' if is_self else '对方'}")
+        return is_self
+    except Exception as e:
+        log.warning(f"[消息判断] 判断异常: {e}")
+        return False
 
 
 # ---------------------------------------------------------------------------
 # 单条消息处理
 # ---------------------------------------------------------------------------
-def _clear_pending_if_match(name: str) -> bool:
-    """若 name 匹配某个待通过好友,立即模拟转发 + 移除标记 + 返回 True。
+def _clear_pending_if_match(name: str, sender: str = None,
+                             text: str = None, msg_type: str = None) -> bool:
+    """若 name 匹配某个待通过好友:模拟转发"已通过请求" + 移除标记 + 异步查资料卡
+    拿微信号后,再用微信号作 targetId 转发原消息,返回 True。
 
-    对方通过后主动发来消息(带红点,被 ② 处理)时忽略原消息,
-    直接在此处模拟"已通过好友请求"转发 MQTT(不等 ③ 轮询)。
+    对方通过后主动发来消息(带红点,被 ② 处理):先模拟"已通过好友请求"通知,
+    再异步打开资料卡获取微信号(写缓存),然后用微信号 targetId 转发原消息。
+    资料卡查询是耗时 UI 操作,放异步线程(等 monitor 释放 UI 锁后执行),不阻塞主循环。
     """
     if not name:
         return False
@@ -147,10 +188,30 @@ def _clear_pending_if_match(name: str) -> bool:
                         chat=m, sender=m,
                         content="我通过了你的朋友验证请求，现在我们可以开始聊天了",
                         msg_type="文本")
-                    log.info(f"[新好友通过] {m} 主动发来消息,已立即模拟转发,忽略原消息")
+                    log.info(f"[新好友通过] {m} 主动发来消息,已立即模拟转发")
                 except Exception as e:
                     log.error(f"[新好友通过] 模拟转发 {m} 失败: {e}")
                 remove_pending(m)
+                # 异步:查资料卡拿微信号(写缓存),再用微信号 targetId 转发原消息
+                if text:
+                    _sender = sender or m
+                    _text = text
+                    _mtype = msg_type or "文本"
+
+                    def _delayed(_m=m, _sender=_sender, _text=_text, _mtype=_mtype):
+                        try:
+                            wxid = mqtt_worker._fetch_wxid_from_profile(_m)
+                            log.info(f"[新好友] 资料卡查得 {_m} 微信号={wxid}，以微信号转发原消息")
+                        except Exception as e:
+                            log.error(f"[新好友] 查资料卡失败 {_m}: {e}")
+                        try:
+                            mqtt_worker.on_wechat_message(
+                                chat=_m, sender=_sender, content=_text, msg_type=_mtype)
+                        except Exception as e:
+                            log.error(f"[新好友] 延迟转发原消息失败 {_m}: {e}")
+
+                    threading.Thread(target=_delayed, daemon=True,
+                                     name=f"newfwd-{m[:8]}").start()
                 return True
     except Exception:
         pass
@@ -159,7 +220,8 @@ def _clear_pending_if_match(name: str) -> bool:
 
 def _process_one(main_window, chat: str, sender: str, text: str,
                  msg_type: str, current_friend: Optional[str],
-                 processed: set[str], file_path: str | None = None) -> None:
+                 processed: set[str], file_path: str | None = None,
+                 msg_item=None) -> None:
     if msg_type == "系统消息":
         # 好友通过验证的系统消息(带红点)忽略,统一由 ③ _check_pending_friends 模拟转发
         if any(kw in text for kw in ("已通过", "现在可以开始聊天", "已添加", "accepted")):
@@ -171,6 +233,11 @@ def _process_one(main_window, chat: str, sender: str, text: str,
         return
 
     is_group = _is_group(chat)
+
+    # 跳过自己（机器人）发的消息：气泡靠右。classify_message 不分方向，靠 rect 判断，
+    # 避免把自己的回复/转发误当成对方新消息再处理（转发/回复/群监控）
+    if msg_item is not None and _is_self_message(msg_item, main_window):
+        return
 
     # /指令（仅 admin，不受监听过滤限制）
     if text.startswith("/") and commands.is_admin(sender):
@@ -187,8 +254,14 @@ def _process_one(main_window, chat: str, sender: str, text: str,
 
     log.info(f"[收到] {chat}({sender}) [{msg_type}]: {text!r}")
 
+    # 群消息关键词监控(命中 → 点头像读真实发送人 → 转发;独立于监听白名单)
+    # 不依赖 is_group:match_group_monitor 自带群匹配,私聊/非配置群直接返回 False
+    if msg_item is not None:
+        if _group_monitor_forward(main_window, chat, sender, text, msg_item, processed):
+            return  # 命中并已转发,不再走 MQTT/回复,避免重复
+
     # 若是待通过好友发来消息,忽略(不转发不回复),统一由 ③ pending 机制模拟转发
-    if _clear_pending_if_match(chat):
+    if _clear_pending_if_match(chat, sender=sender, text=text, msg_type=msg_type):
         return
 
     # 监听过滤：白名单/黑名单同时控制本地回复和 MQTT 转发
@@ -230,6 +303,40 @@ def _do_custom_forward(main_window, chat: str, sender: str, text: str,
             log.info(f"[转发] {chat} → {tgt}")
         except Exception as e:
             log.error(f"[转发] → {tgt} 失败: {e}")
+
+
+def _group_monitor_forward(main_window, chat: str, sender: str, text: str,
+                           msg_item, processed: set[str]) -> bool:
+    """群消息关键词监控:命中 → 点头像读真实发送人 → 转发到配置目标。
+
+    独立于监听白名单,按 group_monitor_list 配置的群+关键词触发。
+    read_group_sender 为耗时 UI 操作(持 UI 锁 + bot_active 由 run_once 保证放行)。
+    Returns: True=命中并已转发;False=未命中。
+    """
+    from .group_monitor import match_group_monitor, read_group_sender
+    targets = match_group_monitor(chat, text)
+    if not targets:
+        return False
+    gmon_id = f"{chat}:GMON:{text}"
+    if gmon_id in processed:
+        return False
+    processed.add(gmon_id)
+    sender_real = ""
+    try:
+        sender_real = read_group_sender(msg_item)
+    except Exception as e:
+        log.warning(f"[群监控] 读发送人失败: {e}")
+    sender_real = sender_real or sender
+    fwd = f"【群消息】{chat}\n发送人：{sender_real}\n{text}"
+    for tgt in targets:
+        try:
+            human_delay()
+            Messages.send_messages_to_friend(friend=tgt, messages=[fwd], close_weixin=False)
+            log.info(f"[群监控] {chat}({sender_real}) → {tgt}: {text[:40]!r}")
+            time.sleep(1)  # 多目标间隔
+        except Exception as e:
+            log.error(f"[群监控] 转发 {tgt} 失败: {e}")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -323,7 +430,8 @@ class Monitor:
                                 msg_text, msg_type, file_path = classify_message(item)
                                 _process_one(main_window, self.current_friend,
                                              self.current_friend, msg_text, msg_type,
-                                             self.current_friend, self.processed, file_path=file_path)
+                                             self.current_friend, self.processed, file_path=file_path,
+                                             msg_item=item)
                             items2 = chat_list.children(control_type="ListItem")
                             self.current_last_rid = items2[-1].element_info.runtime_id if items2 else last_rid
 
@@ -341,9 +449,10 @@ class Monitor:
                     continue
                 time.sleep(1)
                 msgs = read_chat_messages(main_window, number=num)
-                for msg_text, msg_type, file_path in msgs:
+                for msg_text, msg_type, file_path, msg_item in msgs:
                     _process_one(main_window, friend, friend, msg_text, msg_type,
-                                 self.current_friend, self.processed, file_path=file_path)
+                                 self.current_friend, self.processed, file_path=file_path,
+                                 msg_item=msg_item)
                 # 记录为当前停留会话
                 chat_list = main_window.child_window(**Lists.FriendChatList)
                 chat_items = chat_list.children(control_type="ListItem")

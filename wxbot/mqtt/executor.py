@@ -243,6 +243,10 @@ class TaskExecutor:
         try:
             self._enter_ui()
             try:
+                pre_delay = int(bot_config.get("friend_add", {}).get("pre_delay", 3) or 0)
+                if pre_delay > 0:
+                    self._log("INFO", f"加好友前等待 {pre_delay}s（拟人延迟）")
+                    time.sleep(pre_delay)
                 nickname = FriendSettings.add_new_friend(number=target, greetings=verify_text or None,
                                               remark=remark or None, chat_only=chat_only, close_weixin=False)
             finally:
@@ -450,6 +454,10 @@ class TaskExecutor:
             # 发朋友圈是耗时高优操作：持 UI 锁独占，期间 monitor 轮询与点赞/加好友等让位
             self._enter_ui()
             try:
+                pre_delay = int(bot_config.get("moments_post_pre_delay", 3) or 0)
+                if pre_delay > 0:
+                    self._log("INFO", f"发朋友圈前等待 {pre_delay}s（拟人延迟）")
+                    time.sleep(pre_delay)
                 Moments.post_moments(text=text, medias=local_media, close_weixin=False)
             finally:
                 self._exit_ui()
@@ -497,6 +505,10 @@ class TaskExecutor:
         except Exception as e:
             self._log("ERROR", f"获取朋友圈异常 {effective}: {e}")
             return {"status": "error", "error": f"获取朋友圈失败: {e}"}
+        if posts is None:
+            # dump_friend_moments_range 异常（打不开/解析失败）→ 无法查看
+            return {"status": "error", "friend": effective,
+                    "error": f"无法查看 {effective} 的朋友圈（获取内容异常）"}
         self._log("INFO", f"朋友圈导出 {effective} [{start}~{end}] 共 {len(posts)} 条")
         return {"status": "success", "friend": effective,
                 "range": {"start": start, "end": end},
