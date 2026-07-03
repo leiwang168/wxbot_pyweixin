@@ -338,17 +338,12 @@ class MqttCoordinator:
                 operate_val = task.get("operate", "")
                 if operate_val:
                     if target_name:
-                        # "auto" 是默认值，不覆盖全局 operate，避免 per-chat auto 短路掉 global manual
-                        if operate_val == "auto" and target_name in self._extension._session_operate:
-                            del self._extension._session_operate[target_name]
-                            emit("INFO", f"已清除会话 operate (回退为默认): {target_name}", identity.role)
-                        elif operate_val != "auto":
-                            self._extension._session_operate[target_name] = operate_val
-                            emit("INFO", f"已记录会话 operate: {target_name} -> {operate_val}", identity.role)
+                        self._extension.set_session_operate(target_name, operate_val)
+                        emit("INFO", f"会话 operate 已记录({operate_val}): {target_name}", identity.role)
                     else:
                         # targetName 为空 → 全局 operate，对所有联系人生效
-                        self._extension._session_operate["__global__"] = operate_val
-                        emit("INFO", f"已记录全局 operate: __global__ -> {operate_val}", identity.role)
+                        self._extension.set_session_operate("__global__", operate_val)
+                        emit("INFO", f"全局 operate 已记录({operate_val})", identity.role)
                 if target_name:
                     sent_text = task.get("text", "")
                     if sent_text:

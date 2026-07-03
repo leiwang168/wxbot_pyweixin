@@ -55,6 +55,9 @@ class TaskExecutor:
         self._uploader = uploader  # MinioUploader 实例（get_friend_moments 截图上传用，可共享）
         self._wx_busy_event = wx_busy_event  # threading.Event, set during UI ops
         self._ui_lock: threading.Lock | None = None  # UI 互斥锁（由 coordinator 注入）
+        # 最近转发过的 sender(用于 send_text 串线兜底告警):(name, ts)
+        self._recent_forwarded: list[tuple[str, float]] = []
+        self._forwarded_lock = threading.Lock()
 
     def _enter_ui(self) -> None:
         """获取 UI 锁 + 重置微信到聊天主页，确保后续操作从干净状态开始。"""
@@ -168,6 +171,27 @@ class TaskExecutor:
         return v
 
     # ---- send_text ----
+    def record_forwarded(self, name: str) -> None:
+        """记录最近转发过的 sender(用于 send_text 串线兜底告警,30s 滑窗)。"""
+        if not name:
+            return
+        now = time.time()
+        with self._forwarded_lock:
+            self._recent_forwarded.append((name, now))
+            self._recent_forwarded = [(n, t) for n, t in self._recent_forwarded if t > now - 30]
+
+    def _target_in_recent_forwarded(self, name: str) -> bool:
+        if not name:
+            return False
+        now = time.time()
+        with self._forwarded_lock:
+            return any(n == name for n, t in self._recent_forwarded if t > now - 30)
+
+    def _recent_forwarded_names(self) -> list:
+        now = time.time()
+        with self._forwarded_lock:
+            return [n for n, t in self._recent_forwarded if t > now - 30]
+
     def _execute_send_text(self, task: dict) -> dict:
         target_raw = _field(task, "targetName") or _field(task, "targetId", "")
         message_raw = _field(task, "text", "")
@@ -197,6 +221,11 @@ class TaskExecutor:
         else:
             effective = resolved.display_name
             self._log("INFO", f"联系人解析: {target} → {effective} (matched_by={resolved.matched_by})")
+
+        # 兜底告警:targetName 与最近 30s 转发过的 sender 都不匹配 → 可能上游 agent 回错人(串线)
+        # 不阻断发送(跨人回复/转发是合法场景),仅 WARNING 辅助排查
+        if not self._target_in_recent_forwarded(effective) and not self._target_in_recent_forwarded(target):
+            self._log("WARNING", f"[串线告警] send_text 目标 {target!r}(→{effective!r}) 不在最近30s转发的sender里，可能回错人(最近转发: {self._recent_forwarded_names()})")
 
         results = []
         local_file = None

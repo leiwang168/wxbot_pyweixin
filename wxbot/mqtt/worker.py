@@ -30,6 +30,8 @@ from .resolver import ContactResolver
 
 _CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))), "config", "config.json")
+_OPERATE_CACHE_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))), "config", "operate_cache.json")
 
 
 def _patch_open_friend_profile():
@@ -87,6 +89,33 @@ class MqttWorkerExtension:
         self._wx_wechat_id = ""
         self._session_operate: dict[str, str] = {}  # {chat: operate} 会话级 operate 追踪
         self._last_sent: dict[str, tuple[str, float]] = {}  # {chat: (text, ts)} 防回环
+        self._operate_lock = threading.Lock()
+
+    # ---- operate 持久化（manual 接管重启不丢）----
+    def set_session_operate(self, chat: str, val: str) -> None:
+        """记录会话级 operate（"auto" 回退默认并移除，其他值写入），并持久化到缓存文件。"""
+        with self._operate_lock:
+            if val == "auto":
+                self._session_operate.pop(chat, None)
+            else:
+                self._session_operate[chat] = val
+            snapshot = dict(self._session_operate)
+        try:
+            with open(_OPERATE_CACHE_PATH, "w", encoding="utf-8") as f:
+                json.dump(snapshot, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            emit("WARNING", f"写入 operate 缓存失败: {e}")
+
+    def _load_operate_cache(self) -> dict:
+        if not os.path.exists(_OPERATE_CACHE_PATH):
+            return {}
+        try:
+            with open(_OPERATE_CACHE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+        except Exception as e:
+            emit("WARNING", f"读取 operate 缓存失败: {e}")
+            return {}
 
     # ---- 配置迁移与校验 ----
     @staticmethod
@@ -138,6 +167,11 @@ class MqttWorkerExtension:
 
     # ---- 生命周期 ----
     def initialize(self) -> None:
+        # 恢复 operate 持久化状态（manual 接管等），重启后继续生效
+        loaded = self._load_operate_cache()
+        if loaded:
+            self._session_operate = loaded
+            emit("INFO", f"恢复 operate 状态 {len(loaded)} 条: {list(loaded.keys())}")
         # 修复 open_friend_profile 点头像不稳定（get_friend_profile 依赖它）
         try:
             _patch_open_friend_profile()
@@ -400,20 +434,8 @@ class MqttWorkerExtension:
             else:
                 chat_wxid = sender_wxid
 
-        # 新好友（在 pending 待通过列表里）→ 阻塞查资料卡获取真实微信号
-        # pending 由 add_pending 写入（加好友成功时），好友通过并发消息触发此处
-        try:
-            from ..pending_friends import load_pending
-            is_new_friend = any(
-                (m := p.get("match", "")) and (m == chat or m in chat or chat in m)
-                for p in load_pending()
-            )
-        except Exception:
-            is_new_friend = False
-        if is_new_friend:
-            # 异步查资料卡（耗时 UI 操作），不阻塞主消息转发；拿到微信号+性别后写缓存，下条消息生效
-            threading.Thread(target=self._fetch_wxid_from_profile, args=(chat,),
-                             daemon=True, name=f"profile-{chat[:8]}").start()
+        # 新好友查资料卡已由 monitor._clear_pending_if_match 的 _delayed 统一处理
+        # （此处原 is_new_friend 分支会在模拟转发时被重复触发，导致资料卡查两遍，已移除）
 
         # 二次核查自身账号
         if sender_wxid in (self._wx_id, self._wx_wechat_id):
@@ -479,6 +501,11 @@ class MqttWorkerExtension:
                     emit("INFO", f"未匹配转发联系人，已发送 Webhook 提醒: {chat}")
                 except Exception as e:
                     emit("WARNING", f"Webhook 通知失败: {e}")
+        if forwarded and self._executor:
+            try:
+                self._executor.record_forwarded(chat)  # 记录转发 sender,供 send_text 串线兜底告警
+            except Exception:
+                pass
         return forwarded
 
     def on_friend_accepted(self, nickname: str, remark: str = "", tags: list | None = None) -> None:

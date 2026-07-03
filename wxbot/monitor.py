@@ -165,6 +165,13 @@ def _is_self_message(item, main_window) -> bool:
 # ---------------------------------------------------------------------------
 # 单条消息处理
 # ---------------------------------------------------------------------------
+def _is_system_greeting(text: str) -> bool:
+    """对方通过好友验证后微信自动发的系统问候,不该当对话内容转发(否则与模拟通知重复)。"""
+    kws = ("我通过了你的朋友验证请求", "已通过你的朋友验证请求", "已通过",
+           "现在可以开始聊天", "已添加", "accepted")
+    return any(k in (text or '') for k in kws)
+
+
 def _clear_pending_if_match(name: str, sender: str = None,
                              text: str = None, msg_type: str = None) -> bool:
     """若 name 匹配某个待通过好友:模拟转发"已通过请求" + 移除标记 + 异步查资料卡
@@ -181,6 +188,9 @@ def _clear_pending_if_match(name: str, sender: str = None,
         for p in load_pending():
             m = p.get("match", "")
             if m and (m == name or m in name or name in m):
+                # 先移除待通过标记：避免下方模拟转发触发 on_wechat_message 的 is_new_friend
+                # 再查一次资料卡（资料卡查两遍的根因）
+                remove_pending(m)
                 # 模拟好友通过通知转发 MQTT(延迟10秒,更自然)
                 time.sleep(10)
                 try:
@@ -191,8 +201,7 @@ def _clear_pending_if_match(name: str, sender: str = None,
                     log.info(f"[新好友通过] {m} 主动发来消息,已立即模拟转发")
                 except Exception as e:
                     log.error(f"[新好友通过] 模拟转发 {m} 失败: {e}")
-                remove_pending(m)
-                # 异步:查资料卡拿微信号(写缓存),再用微信号 targetId 转发原消息
+                # 异步:查资料卡拿微信号(写缓存);若原消息非系统问候,再用微信号 targetId 转发
                 if text:
                     _sender = sender or m
                     _text = text
@@ -201,9 +210,13 @@ def _clear_pending_if_match(name: str, sender: str = None,
                     def _delayed(_m=m, _sender=_sender, _text=_text, _mtype=_mtype):
                         try:
                             wxid = mqtt_worker._fetch_wxid_from_profile(_m)
-                            log.info(f"[新好友] 资料卡查得 {_m} 微信号={wxid}，以微信号转发原消息")
+                            log.info(f"[新好友] 资料卡查得 {_m} 微信号={wxid}")
                         except Exception as e:
                             log.error(f"[新好友] 查资料卡失败 {_m}: {e}")
+                        # 系统问候(对方通过验证的微信系统消息）不当对话内容转发,避免与上面模拟通知重复
+                        if _is_system_greeting(_text):
+                            log.info(f"[新好友] {_m} 首条为系统问候,跳过转发原消息")
+                            return
                         try:
                             mqtt_worker.on_wechat_message(
                                 chat=_m, sender=_sender, content=_text, msg_type=_mtype)
