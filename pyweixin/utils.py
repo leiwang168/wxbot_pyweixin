@@ -497,10 +497,9 @@ def scan_for_new_messages(main_window:WindowSpecification=None,delay:float=0.3,i
     if new_message_num:
         new_message_num=int(new_message_num.group(0))
         session_list=main_window.child_window(**Main_window.SessionList)
-        session_list.type_keys('{END}'*2)
-        last_item=session_list.children(control_type='ListItem')[-1].window_text()
-        session_list.type_keys('{HOME}'*2)
+        session_list.type_keys('{HOME}')
         session_list.wait(wait_for='ready',timeout=2)
+        prev_last=None
         while sum(newMessages_dict.values())<new_message_num:#当最终的新消息总数之和大于等于实际新消息总数时退出循环
             #遍历获取带有新消息的ListItem
             listItems=session_list.children(control_type='ListItem')
@@ -510,9 +509,11 @@ def scan_for_new_messages(main_window:WindowSpecification=None,delay:float=0.3,i
             newMessageNums.extend(nums)
             newMessageSenders.extend(senders)
             newMessages_dict=dict(zip(newMessageSenders,newMessageNums))
-            session_list.type_keys('{PGDN}')
-            if listItems[-1].window_text()==last_item:
+            cur_last=listItems[-1].window_text() if listItems else ''
+            if cur_last==prev_last:#到底（PGDN 后末项不变），不再翻页
                 break
+            prev_last=cur_last
+            session_list.type_keys('{PGDN}')
         session_list.type_keys('{HOME}')
     if close_weixin:main_window.close()
     return newMessages_dict

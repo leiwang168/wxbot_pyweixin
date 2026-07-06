@@ -38,6 +38,15 @@ def _is_group(chat: str) -> bool:
     return chat in bot_config.get("group", [])
 
 
+def _parse_hhmm(s: str) -> int | None:
+    """解析 HH:MM 为当日分钟数(0~1439)，失败返回 None。"""
+    try:
+        h, m = str(s).split(":")
+        return int(h) * 60 + int(m)
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # 当前窗口直接发送（移植 test_global_monitor_simple.send_message_in_current_window）
 # ---------------------------------------------------------------------------
@@ -532,13 +541,39 @@ class Monitor:
         self.check_interval = float(bot_config.get("monitor_check_interval", 10) or 10)
         self._run_timeout = float(bot_config.get("monitor_run_timeout", 30) or 30)
         log.info(f"📨 消息主循环启动（轮询间隔 {self.check_interval}s，单轮超时 {self._run_timeout}s）")
+        in_pause = False
         try:
             while not self._stop.is_set():
+                if self._in_pause_period():
+                    if not in_pause:
+                        in_pause = True
+                        log.info(f"📨 进入消息监听暂停时段"
+                                 f"(停止 {bot_config.get('everyday_stop_bot_time')} ~ 恢复 {bot_config.get('everyday_start_bot_time')})，停止轮询")
+                    self._stop.wait(self.check_interval)
+                    continue
+                if in_pause:
+                    in_pause = False
+                    log.info("📨 暂停时段结束，恢复消息监听")
                 self._run_once_guarded()
                 self._stop.wait(self.check_interval)
         except KeyboardInterrupt:
             self._stop.set()
         log.info("📨 消息主循环已停止")
+
+    def _in_pause_period(self) -> bool:
+        """是否在消息监听暂停时段（everyday_stop_bot_time ~ everyday_start_bot_time，可跨夜）。"""
+        if not bot_config.get("everyday_start_stop_bot_switch", False):
+            return False
+        start = _parse_hhmm(bot_config.get("everyday_start_bot_time", ""))  # 恢复监听时间
+        stop = _parse_hhmm(bot_config.get("everyday_stop_bot_time", ""))    # 停止监听时间
+        if start is None or stop is None or start == stop:
+            return False
+        now = time.localtime()
+        now_min = now.tm_hour * 60 + now.tm_min
+        # 停止时段 = stop_time ~ start_time
+        if stop < start:
+            return stop <= now_min < start  # 同日,如 01:00~08:00
+        return now_min >= stop or now_min < start  # 跨夜,如 23:00~次日08:00
 
     def _run_once_guarded(self) -> None:
         """单轮 run_once 放入子线程执行，超时则放弃本轮。

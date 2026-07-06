@@ -77,6 +77,15 @@ class TaskExecutor:
 
     def _exit_ui(self) -> None:
         """释放 UI 锁，标记退出 UI 操作。"""
+        # 先恢复微信到聊天主页（此时 bot_active 仍 True，放行点击）：上一个任务
+        # （add_friend 打开加好友面板/资料卡等)可能切走窗口，不恢复会让 monitor
+        # 下一轮读不到会话列表/聊天区，导致加好友期间到达的消息被漏掉
+        try:
+            mw = Navigator.open_weixin(is_maximize=False)
+            mw.child_window(**SideBar.Weixin).click_input()
+            time.sleep(0.15)
+        except Exception as e:
+            self._log("WARNING", f"_exit_ui 恢复聊天主页失败: {e}")
         input_blocker.set_bot_active(False)
         if self._wx_busy_event:
             self._wx_busy_event.clear()
