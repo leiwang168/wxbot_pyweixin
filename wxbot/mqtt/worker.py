@@ -589,80 +589,82 @@ class MqttWorkerExtension:
         return "\n".join(lines)
 
     def _launch_async_media_followup(self, chat: str, sender: str, msg_type: str) -> None:
-        """后台线程：保存最新媒体 → 上传 MinIO → 补发带 fileUrl 的 MQTT 消息。"""
-        def _run():
+        """同步保存最新媒体 → 上传 MinIO → 补发带 fileUrl 的 MQTT 消息。
+
+        on_wechat_message 在 monitor run_once 持锁期间调用，直接同步保存即可
+        （不需要异步线程 + _enter_ui 等锁，避免抢不到锁导致图片不保存）。
+        """
+        try:
+            result = self._save_latest_media(chat, msg_type)
+        except Exception as e:
+            emit("ERROR", f"媒体保存异常: {e}")
+            return
+        if not result:
+            return
+        file_name, file_size, file_url = result
+
+        # 补发：格式与主转发一致，附带 fileUrl
+        msg_id = f"wechat-{uuid.uuid4().hex[:8]}"
+        sender_wxid = sender
+        chat_wxid = chat
+        if self.resolver.cache_ready:
             try:
-                self._enter_ui()
+                resolved = self.resolver.resolve(sender)
+                if resolved.success and resolved.wxid:
+                    sender_wxid = resolved.wxid
+            except Exception:
+                pass
+            if chat != sender:
                 try:
-                    result = self._save_latest_media(chat, msg_type)
-                finally:
-                    self._exit_ui()
-                if not result:
-                    return
-                file_name, file_size, file_url = result
+                    resolved = self.resolver.resolve(chat)
+                    if resolved.success and resolved.wxid:
+                        chat_wxid = resolved.wxid
+                except Exception:
+                    pass
+            else:
+                chat_wxid = sender_wxid
 
-                # 补发：格式与主转发一致，附带 fileUrl
-                msg_id = f"wechat-{uuid.uuid4().hex[:8]}"
-                sender_wxid = sender
-                chat_wxid = chat
-                if self.resolver.cache_ready:
-                    try:
-                        resolved = self.resolver.resolve(sender)
-                        if resolved.success and resolved.wxid:
-                            sender_wxid = resolved.wxid
-                    except Exception:
-                        pass
-                    if chat != sender:
-                        try:
-                            resolved = self.resolver.resolve(chat)
-                            if resolved.success and resolved.wxid:
-                                chat_wxid = resolved.wxid
-                        except Exception:
-                            pass
-                    else:
-                        chat_wxid = sender_wxid
-
-                display_text = f"[{msg_type}] {file_name}"
-                has_specific = any(i.enabled and i.forward_contacts and chat in i.forward_contacts
-                                   for i in self._identities)
-                for ident in self._identities:
-                    if not ident.enabled:
-                        continue
-                    forward_topic = ident.resolve_forward_topic()
-                    if not forward_topic:
-                        continue
-                    if ident.forward_contacts:
-                        if chat not in ident.forward_contacts:
-                            continue
-                    elif has_specific:
-                        continue
-                    publish_topic = forward_topic
-                    session_operate = self._session_operate.get(chat)
-                    if not session_operate or session_operate == "auto":
-                        session_operate = self._session_operate.get("__global__", "auto")
-                    payload = {
-                        "event": "wechat_message", "correlationId": msg_id,
-                        "senderId": sender_wxid, "senderName": chat,
-                        "chatId": chat_wxid, "targetId": chat_wxid,
-                        "text": display_text, "chat": chat, "type": msg_type,
-                        "agentId": ident.agent_id, "role": ident.role,
-                        "selfWxName": self._wx_nickname, "selfWxId": self._wx_id,
-                        "ts": int(time.time() * 1000),
-                        "operate": session_operate,
-                        "fileUrl": file_url, "fileName": file_name, "fileSize": file_size,
-                    }
-                    payload_str = json.dumps(payload, ensure_ascii=False)
-                    if self._adapter.publish_safe(publish_topic, payload_str):
-                        emit("INFO", f"补发媒体消息 -> {publish_topic} file={file_name}", ident.role)
-            except Exception as e:
-                emit("ERROR", f"异步媒体处理异常: {e}")
-
-        threading.Thread(target=_run, daemon=True, name=f"media-{chat[:8]}").start()
+        display_text = f"[{msg_type}] {file_name}"
+        has_specific = any(i.enabled and i.forward_contacts and chat in i.forward_contacts
+                           for i in self._identities)
+        for ident in self._identities:
+            if not ident.enabled:
+                continue
+            forward_topic = ident.resolve_forward_topic()
+            if not forward_topic:
+                continue
+            if ident.forward_contacts:
+                if chat not in ident.forward_contacts:
+                    continue
+            elif has_specific:
+                continue
+            callback_prefix = ident.resolve_callback_prefix()
+            publish_topic = f"{forward_topic}/{msg_id}" if callback_prefix and forward_topic == callback_prefix else forward_topic
+            session_operate = self._session_operate.get(chat)
+            if not session_operate or session_operate == "auto":
+                session_operate = self._session_operate.get("__global__", "auto")
+            payload = {
+                "event": "wechat_message", "correlationId": msg_id,
+                "senderId": sender_wxid, "senderName": chat,
+                "chatId": chat_wxid, "targetId": chat_wxid,
+                "text": display_text, "chat": chat, "type": msg_type,
+                "agentId": ident.agent_id, "role": ident.role,
+                "selfWxName": self._wx_nickname, "selfWxId": self._wx_id,
+                "ts": int(time.time() * 1000),
+                "operate": session_operate,
+                "fileUrl": file_url, "fileName": file_name, "fileSize": file_size,
+            }
+            payload_str = json.dumps(payload, ensure_ascii=False)
+            if self._adapter.publish_safe(publish_topic, payload_str):
+                emit("INFO", f"补发媒体消息 -> {publish_topic} file={file_name}", ident.role)
 
     def _save_latest_media(self, chat: str, msg_type: str) -> tuple[str, int, str] | None:
-        """用 Messages.save_media 保存最新一张图片/视频 → 上传 MinIO。"""
+        """右键图片消息（left+40 偏移点缩略图）→ 复制 → 剪贴板落地 → 上传 MinIO。"""
         import tempfile
-        from pyweixin import Messages as WeChatMessages
+        import pyautogui
+        from pyweixin.WeChatTools import Navigator, mouse
+        from pyweixin.Uielements import Lists, MenuItems
+        from pyweixin.WinSettings import SystemSettings
 
         if msg_type not in ("图片", "视频"):
             return None
@@ -670,29 +672,61 @@ class MqttWorkerExtension:
         temp_dir = os.path.join(tempfile.gettempdir(), f"wxbot_media_{uuid.uuid4().hex[:6]}")
         os.makedirs(temp_dir, exist_ok=True)
         try:
-            WeChatMessages.save_media(friend=chat, number=1, target_folder=temp_dir,
-                                      close_weixin=False)
-            # save_media 保存格式: "与{friend}的聊天图片1.png" / "与{friend}的聊天视频1.mp4"
-            saved = sorted(Path(temp_dir).glob("*"), key=lambda f: f.stat().st_mtime, reverse=True)
-            if not saved:
-                emit("WARNING", f"save_media 未生成文件: {temp_dir}")
+            mw = Navigator.open_weixin(is_maximize=False)
+            chat_list = mw.child_window(**Lists.FriendChatList)
+            if not chat_list.exists(timeout=1):
                 return None
-            local_file = saved[0]
-            file_name = local_file.name
-            file_size = local_file.stat().st_size
+            items = chat_list.children(control_type='ListItem')
+            if not items:
+                return None
+            last = items[-1]
+            r = last.rectangle()
+            # 右键坐标偏移到组件最左侧+80（点中图片缩略图，避免小图片点空）
+            mouse.right_click(coords=(r.left + 200, (r.top + r.bottom) // 2))
+            time.sleep(0.5)
+            copy_item = mw.child_window(**MenuItems.CopyMenuItem)
+            copied = False
+            if copy_item.exists(timeout=1):
+                copy_item.click_input()
+                time.sleep(0.5)
+                path = os.path.join(temp_dir, f"img_{int(time.time()*1000)}.png")
+                if SystemSettings.save_pasted_image(path):
+                    file_name = os.path.basename(path)
+                    file_size = os.path.getsize(path)
+                    file_url = ""
+                    if self._uploader and self._uploader.available:
+                        file_url = self._uploader.upload(path, chat=chat) or ""
+                    emit("INFO", f"图片右键复制保存: {file_name} ({file_size} bytes) url={file_url}")
+                    try:
+                        os.remove(path)
+                        os.rmdir(temp_dir)
+                    except OSError:
+                        pass
+                    return (file_name, file_size, file_url)
+                copied = True
+            # 复制失败 → esc 关菜单 + 截图兜底
+            # if not copied:
+            #     pyautogui.press('esc')
+            tmp = os.path.join(temp_dir, f"img_{int(time.time()*1000)}.png")
+            pyautogui.screenshot().crop((r.left, r.top, r.right, r.bottom)).save(tmp)
+            file_name = os.path.basename(tmp)
+            file_size = os.path.getsize(tmp)
             file_url = ""
             if self._uploader and self._uploader.available:
-                file_url = self._uploader.upload(str(local_file), chat=chat) or ""
-            # 清理
+                file_url = self._uploader.upload(tmp, chat=chat) or ""
+            emit("INFO", f"图片截图兜底: {file_name} ({file_size} bytes) url={file_url}")
             try:
-                os.remove(str(local_file))
+                os.remove(tmp)
                 os.rmdir(temp_dir)
             except OSError:
                 pass
-            emit("INFO", f"媒体保存成功: {file_name} ({file_size} bytes) url={file_url}")
             return (file_name, file_size, file_url)
         except Exception as e:
-            emit("ERROR", f"save_media 异常: {e}")
+            emit("ERROR", f"图片保存异常: {e}")
+            try:
+                pyautogui.press('esc')
+            except Exception:
+                pass
             try:
                 os.rmdir(temp_dir)
             except OSError:

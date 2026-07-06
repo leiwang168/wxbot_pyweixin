@@ -89,7 +89,7 @@ def _send_to_chat(main_window, chat: str, messages: list[str], current_friend: O
 # ---------------------------------------------------------------------------
 # 会话翻页查找点击（移植 test_global_monitor_simple._find_and_click_session）
 # ---------------------------------------------------------------------------
-def _find_and_click_session(session_list, friend, max_pages: int = 60) -> bool:
+def _find_and_click_session(session_list, friend, max_pages: int = 10) -> bool:
     session_list.type_keys("{HOME}")
     time.sleep(0.2)
     prev_last = None
@@ -181,6 +181,64 @@ def _is_system_greeting(text: str) -> bool:
     return any(k in (text or '') for k in kws)
 
 
+def _confirm_transfer(main_window, msg_item, chat: str) -> bool:
+    """确认收款好友转账。返回是否收款成功。
+
+    转账消息文本含"待你收款"（待收款状态）。点击转账消息弹出独立详情窗口 →
+    在 Desktop 中找"确认收款"按钮 → 点击 → 确认弹框。
+    """
+    from pywinauto import Desktop
+    try:
+        # 点击转账消息打开详情窗口
+        msg_item.click_input()
+        time.sleep(1.5)
+        # 找"收款"按钮：先试 main_window（详情可能是 modal 子窗口），再试 Desktop（独立弹出）
+        btn = main_window.child_window(title="收款", control_type="Button")
+        if not btn.exists(timeout=1):
+            desktop = Desktop(backend='uia')
+            btn = desktop.window(title="收款", control_type="Button")
+        if not btn.exists(timeout=1):
+            btn = main_window.child_window(title_re=".*收款.*", control_type="Button")
+        if not btn.exists(timeout=1):
+            log.info(f"[转账收款] {chat} 未找到收款按钮，dump 详情窗口结构:")
+            try:
+                for w in Desktop(backend='uia').windows():
+                    cn = w.element_info.class_name or ''
+                    if not w.is_visible():
+                        continue
+                    if cn.startswith('mmui::') and cn != 'mmui::MainWindow':
+                        log.info(f"  窗口 class={cn} title={w.window_text()[:30]!r} rect={w.rectangle()}")
+                        for d in w.descendants():
+                            t = (d.window_text() or '').replace('\n', ' ')[:30]
+                            if t:
+                                log.info(f"    [{d.control_type}] class={d.class_name()} text={t!r}")
+            except Exception as de:
+                log.warning(f"[转账诊断] dump 异常: {de}")
+            pyautogui.press('esc')
+            return False
+        btn.click_input()
+        time.sleep(1)
+        # 确认弹框（"确认收下"）
+        desktop = Desktop(backend='uia')
+        confirm = main_window.child_window(title="确认收下", control_type="Button")
+        if not confirm.exists(timeout=1):
+            confirm = desktop.window(title="确认收下", control_type="Button")
+        if not confirm.exists(timeout=1):
+            confirm = main_window.child_window(title_re=".*确认.*|.*收下.*", control_type="Button")
+        if confirm.exists(timeout=0.5):
+            confirm.click_input()
+            time.sleep(0.5)
+            return True
+        return False
+    except Exception as e:
+        log.warning(f"[转账收款] 异常: {chat} -> {e}")
+        try:
+            pyautogui.press('esc')
+        except Exception:
+            pass
+        return False
+
+
 def _clear_pending_if_match(name: str, sender: str = None,
                              text: str = None, msg_type: str = None) -> bool:
     """若 name 匹配某个待通过好友:模拟转发"已通过请求" + 移除标记 + 异步查资料卡
@@ -270,11 +328,29 @@ def _process_one(main_window, chat: str, sender: str, text: str,
         return
 
     msg_id = f"{chat}:{msg_type}:{text}"
+    # 媒体消息(图片/视频/文件)text 可能相同(如多张图片都是"图片")，用 runtime_id 区分避免误去重
+    if msg_item is not None and msg_type in ("图片", "视频", "文件"):
+        try:
+            msg_id = f"{chat}:{msg_type}:{msg_item.element_info.runtime_id}"
+        except Exception:
+            pass
     if msg_id in processed:
         return
     processed.add(msg_id)
 
     log.info(f"[收到] {chat}({sender}) [{msg_type}]: {text!r}")
+
+    # 转账自动收款（收到好友转账 → 确认收款 → 飞书提醒）
+    if msg_type == "微信转账" and bot_config.get("auto_collect_transfer", False) and msg_item is not None:
+        if _confirm_transfer(main_window, msg_item, chat):
+            log.info(f"[转账收款] 已确认收款: {chat}")
+            try:
+                from . import webhook_send
+                webhook_send.send_webhook(
+                    title=f"【转账收款】{chat}",
+                    content=f"已确认收款\n来源: {chat}\n时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            except Exception as e:
+                log.warning(f"[转账收款] 飞书提醒失败: {e}")
 
     # 群消息关键词监控(命中 → 点头像读真实发送人 → 转发;独立于监听白名单)
     # 不依赖 is_group:match_group_monitor 自带群匹配,私聊/非配置群直接返回 False

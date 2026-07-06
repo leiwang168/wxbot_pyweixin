@@ -49,6 +49,8 @@ DEFAULTS: dict[str, Any] = {
     # 群消息关键词监控（命中 → 点头像读真实发送人 → 转发，独立于监听白名单）
     "group_monitor_switch": False,
     "group_monitor_list": [],  # [{"group":"群名","keywords":["车找人"],"forward_to":["文件传输助手"]}]
+    # 转账自动收款（收到好友转账 → 自动确认收款 → 飞书提醒）
+    "auto_collect_transfer": False,
     # 新好友
     "new_friend_switch": False,
     "new_friend_reply_switch": False,

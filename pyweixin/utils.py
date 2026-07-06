@@ -500,7 +500,9 @@ def scan_for_new_messages(main_window:WindowSpecification=None,delay:float=0.3,i
         session_list.type_keys('{HOME}')
         session_list.wait(wait_for='ready',timeout=2)
         prev_last=None
-        while sum(newMessages_dict.values())<new_message_num:#当最终的新消息总数之和大于等于实际新消息总数时退出循环
+        _max_pages=2  # 翻页上限，防止大量会话时滚到底导致 UI 卡死
+        _page=0
+        while sum(newMessages_dict.values())<new_message_num and _page<_max_pages:
             #遍历获取带有新消息的ListItem
             listItems=session_list.children(control_type='ListItem')
             time.sleep(delay)
@@ -514,6 +516,7 @@ def scan_for_new_messages(main_window:WindowSpecification=None,delay:float=0.3,i
                 break
             prev_last=cur_last
             session_list.type_keys('{PGDN}')
+            _page+=1
         session_list.type_keys('{HOME}')
     if close_weixin:main_window.close()
     return newMessages_dict
