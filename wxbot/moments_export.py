@@ -82,6 +82,68 @@ def _force_close_sns_window() -> int:
     return len(targets)
 
 
+def _save_moment_images(sns_detail_list, moments_window, photo_num, tmp_dir, log):
+    """点开朋友圈大图预览，逐张右键复制→剪贴板→落地原图。返回本地路径列表。
+    复用 SDK dump_friend_posts.save_media 流程；任何环节异常返回已收集的(可能空)。"""
+    from pyweixin.WeChatTools import mouse
+    from pyweixin.Uielements import MousePos, MenuItems
+    from pyweixin.WinSettings import SystemSettings
+    paths = []
+    try:
+        comment_detail = sns_detail_list.children(control_type='ListItem', title='')[1]
+        mouse.click(coords=MousePos(comment_detail).PostDetailImagePos)   # 点开大图预览
+        time.sleep(0.8)
+        pyautogui.press('left', presses=photo_num, interval=0.15)          # 翻到第一张
+        click_pos = MousePos(sns_detail_list).PostDetailImageClickPos
+        for i in range(photo_num):
+            mouse.right_click(coords=click_pos)
+            copy_item = moments_window.child_window(**MenuItems.CopyMenuItem)
+            if not copy_item.exists(timeout=0.4):
+                continue
+            copy_item.click_input()
+            path = os.path.join(tmp_dir, f"img_{i}.png")
+            time.sleep(0.5)                                                 # 剪贴板缓存
+            if SystemSettings.save_pasted_image(path):
+                paths.append(path)
+            pyautogui.press('right', interval=0.05)
+        pyautogui.press('esc')                                              # 退出大图预览
+    except Exception as e:
+        log("WARNING", f"[Moments] 大图保存异常，回退截图: {e}")
+        try:
+            pyautogui.press('esc')
+        except Exception:
+            pass
+    return paths
+
+
+def _save_moment_video_cover(sns_detail_list, tmp_dir, log):
+    """双击朋友圈视频点开预览，截图预览画面作封面。返回本地图片路径或 None。"""
+    from pyweixin.WeChatTools import mouse
+    from pyweixin.Uielements import MousePos, Windows
+    from pywinauto import Desktop
+    try:
+        content_listitem = sns_detail_list.children(control_type='ListItem', title='')[0]
+        click_pos = MousePos(content_listitem).PostDetailVideoClickPos
+        mouse.double_click(coords=click_pos)  # 点开视频预览
+        time.sleep(1.5)  # 等预览加载/首帧
+        path = os.path.join(tmp_dir, "video_cover.png")
+        image_preview = Desktop(backend='uia').window(**Windows.ImagePreviewWindow)
+        if image_preview.exists(timeout=1.0):
+            r = image_preview.rectangle()
+            pyautogui.screenshot().crop((r.left, r.top, r.right, r.bottom)).save(path)
+        else:
+            pyautogui.screenshot().save(path)  # 预览未弹出，全屏兜底
+        pyautogui.press('esc')  # 退出预览
+        return path
+    except Exception as e:
+        log("WARNING", f"[Moments] 视频封面截图异常: {e}")
+        try:
+            pyautogui.press('esc')
+        except Exception:
+            pass
+        return None
+
+
 def dump_friend_moments_range(friend: str, start, end, uploader,
                               limit: int = 50, log_func=emit) -> list[dict]:
     """遍历好友朋友圈（按时间倒序），只保留发布时间落在 [start, end] 闭区间的条目。
@@ -176,29 +238,57 @@ def dump_friend_moments_range(friend: str, start, end, uploader,
                 object_key = f"{base_key}.png"
             used_date_keys.add(base_key)
 
-            # 截图：crop sns_detail_list 区域（测试脚本验证的裁剪偏移 left-20/right-50）
+            # 有图：优先点开大图保存原图；有视频：点开预览截图作封面；失败/都没有回退 crop
+            tmp_dir = tempfile.mkdtemp(prefix="moment_imgs_")
+            image_urls = []
+            video_cover_url = ""
+            if photo_num > 0:
+                img_paths = _save_moment_images(sns_detail_list, moments_window, photo_num, tmp_dir, log)
+                if img_paths and uploader and getattr(uploader, 'available', False):
+                    img_stem = object_key[:-4]  # 去 .png，叠加 _{idx}.png
+                    for idx, ip in enumerate(img_paths):
+                        u = uploader.upload_named(ip, f"{img_stem}_{idx}.png") or ""
+                        if u:
+                            image_urls.append(u)
+                elif img_paths:
+                    log("WARNING", "[Moments] MinIO 不可用，大图未上传")
+            elif video_num > 0:
+                cover = _save_moment_video_cover(sns_detail_list, tmp_dir, log)
+                if cover and uploader and getattr(uploader, 'available', False):
+                    video_cover_url = uploader.upload_named(cover, f"{object_key[:-4]}_video.png") or ""
+                elif cover:
+                    log("WARNING", "[Moments] MinIO 不可用，视频封面未上传")
+
+            # crop sns_detail_list 区域：大图/视频封面失败或纯文字时作内容截图或兜底
             tmp_path = os.path.join(tempfile.gettempdir(), f"moment_{int(time.time()*1000)}_{recorded}.png")
             url = ""
-            try:
-                detail_rect = sns_detail_list.rectangle()
-                full = pyautogui.screenshot()
-                full.crop((detail_rect.left, detail_rect.top,
-                           detail_rect.right, detail_rect.bottom)).save(tmp_path)
-                if uploader and getattr(uploader, 'available', False):
-                    url = uploader.upload_named(tmp_path, object_key) or ""
-                else:
-                    log("WARNING", "[Moments] MinIO 不可用，截图未上传")
-            except Exception as e:
-                log("WARNING", f"[Moments] 截图/上传失败: {e}")
-            finally:
+            if not image_urls and not video_cover_url:
                 try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
+                    detail_rect = sns_detail_list.rectangle()
+                    full = pyautogui.screenshot()
+                    full.crop((detail_rect.left, detail_rect.top,
+                               detail_rect.right, detail_rect.bottom)).save(tmp_path)
+                    if uploader and getattr(uploader, 'available', False):
+                        url = uploader.upload_named(tmp_path, object_key) or ""
+                    else:
+                        log("WARNING", "[Moments] MinIO 不可用，截图未上传")
+                except Exception as e:
+                    log("WARNING", f"[Moments] 截图/上传失败: {e}")
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            try:
+                import shutil as _shutil
+                _shutil.rmtree(tmp_dir, ignore_errors=True)
+            except Exception:
+                pass
 
             posts.append({
                 '发布时间': post_time, '发布日期': date_str, '内容': content,
-                '图片数量': photo_num, '视频数量': video_num, 'screenshotUrl': url,
+                '图片数量': photo_num, '视频数量': video_num,
+                'screenshotUrl': url, 'imageUrls': image_urls,
+                'videoCoverUrl': video_cover_url,
             })
             recorded += 1
             log("INFO", f"[Moments] [{recorded}] {post_time} | 图{photo_num} 视频{video_num} | {object_key}")
@@ -209,9 +299,11 @@ def dump_friend_moments_range(friend: str, start, end, uploader,
                 log("INFO", "[Moments] 已到朋友圈底部")
                 break
     except Exception as e:
-        # 获取朋友圈内容异常（打不开/控件缺失/解析失败等）：直接返回 None（无法查看），不再继续，不抛给上层
-        log("ERROR", f"[Moments] 获取 {friend} 朋友圈内容异常，无法查看: {e}")
-        return None
+        # 遍历异常（COM 卡死/控件缺失等）：已收集的 posts 不丢弃，返回部分结果
+        log("ERROR", f"[Moments] 获取 {friend} 朋友圈异常(已收集 {len(posts)} 条): {e}")
+        if not posts:
+            return None  # open 阶段失败，无可返回（上层据此回调"无法查看"）
+        # 已有部分：落入 finally 后 return posts（返回已收集的）
     finally:
         if moments_window is not None:
             try:
