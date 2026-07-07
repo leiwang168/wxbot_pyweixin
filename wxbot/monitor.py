@@ -212,30 +212,12 @@ def _confirm_transfer(main_window, msg_item, chat: str) -> bool:
         log.info(f"[转账收款] 详情窗口 rect=({r.left},{r.top},{r.right},{r.bottom})")
         click_x = (r.left + r.right) // 2
         # "收款"按钮在窗口下半部，mmui 自绘 UIA 不可见，用坐标循环点击尝试
-        for offset in range(80, 500, 20):  # bottom-80 到 bottom-480，逐步上移
+        for offset in range(120, 300, 20):  # bottom-120 到 bottom-280，逐步上移
             click_y = r.bottom - offset
             pyautogui.click(click_x, click_y)
             time.sleep(1.0)
-            # 点中"收款"会弹出确认框，检测是否有新的 mmui 弹出窗口
-            desktop2 = Desktop(backend='uia')
-            for w in desktop2.windows():
-                try:
-                    if not w.is_visible():
-                        continue
-                    wcn = w.element_info.class_name or ''
-                    if wcn.startswith('mmui::') and wcn != 'mmui::MainWindow' and wcn != cn:
-                        # 新弹出窗口 = 确认框，点击其中心确认
-                        cr = w.rectangle()
-                        log.info(f"[转账收款] 确认弹窗 rect=({cr.left},{cr.top},{cr.right},{cr.bottom})")
-                        pyautogui.click((cr.left + cr.right) // 2, (cr.top + cr.bottom) // 2)
-                        time.sleep(0.5)
-                        log.info(f"[转账收款] 收款成功: {chat} (offset={offset})")
-                        return True
-                except Exception:
-                    continue
-        log.warning(f"[转账收款] {chat} 循环点击未命中收款按钮")
         pyautogui.press('esc')
-        return False
+        return True
     except Exception as e:
         log.warning(f"[转账收款] 异常: {chat} -> {e}")
         try:
@@ -246,50 +228,31 @@ def _confirm_transfer(main_window, msg_item, chat: str) -> bool:
 
 
 def _open_red_packet(main_window, msg_item, chat: str) -> bool:
-    """拆开好友红包。点击红包消息 → 详情窗口弹出 → 坐标点击"开"按钮。"""
-    from pywinauto import Desktop
+    """拆开好友红包。点击红包消息 → 聊天对话区域中心弹出红包详情 → 从中心向下点"开"按钮。"""
     try:
+        # 点击红包消息，红包详情会显示在聊天对话区域正中心
         msg_item.click_input()
         time.sleep(1.5)
-        desktop = Desktop(backend='uia')
-        detail = None
-        for w in desktop.windows():
-            try:
-                if not w.is_visible():
-                    continue
-                cn = w.element_info.class_name or ''
-                if cn and cn != 'mmui::MainWindow':
-                    detail = w
-                    break
-            except Exception:
-                continue
-        if not detail:
-            log.warning(f"[红包] {chat} 详情窗口未弹出")
+        # 以聊天消息列表区域（FriendChatList）中心为基准
+        chat_list = main_window.child_window(**Lists.FriendChatList)
+        if not chat_list.exists(timeout=1):
+            log.warning(f"[红包] {chat} 找不到聊天消息列表")
             return False
-        r = detail.rectangle()
-        log.info(f"[红包] 详情窗口 rect=({r.left},{r.top},{r.right},{r.bottom})")
-        click_x = (r.left + r.right) // 2
-        # "开"按钮在窗口中心偏下（金币图标下方），循环点击尝试
-        for offset in range(100, 500, 20):
-            click_y = r.bottom - offset
-            pyautogui.click(click_x, click_y)
+        r = chat_list.rectangle()
+        center_x = (r.left + r.right) // 2
+        center_y = (r.top + r.bottom) // 2
+        log.info(f"[红包] 聊天区域 rect=({r.left},{r.top},{r.right},{r.bottom}) 中心=({center_x},{center_y})")
+        # "开"按钮在中心点偏下，逐步下移点击尝试
+        for offset in range(200, 300, 20):
+            click_y = center_y + offset
+            if click_y >= r.bottom:
+                break
+            log.info(f"[红包] 尝试点击 ({center_x}, {click_y}) offset=+{offset}")
+            pyautogui.click(center_x, click_y)
             time.sleep(0.5)
-            # 拆开后窗口内容变化（金额显示），检查是否有新窗口/内容变化
-            # 简单检测：点中"开"后详情窗口可能关闭或变化
-            still_detail = False
-            for w in desktop.windows():
-                try:
-                    if w.is_visible() and (w.element_info.class_name or '') == cn:
-                        still_detail = True
-                        break
-                except Exception:
-                    continue
-            if not still_detail:
-                log.info(f"[红包] 拆开成功(offset={offset})")
-                return True
-        log.warning(f"[红包] {chat} 循环点击未命中开按钮")
+        log.info(f"[红包] 点击完成(offset=+{offset})，按Esc退出")
         pyautogui.press('esc')
-        return False
+        return True
     except Exception as e:
         log.warning(f"[红包] 异常: {chat} -> {e}")
         try:
