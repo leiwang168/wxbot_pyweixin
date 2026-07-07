@@ -192,46 +192,106 @@ def _confirm_transfer(main_window, msg_item, chat: str) -> bool:
         # 点击转账消息打开详情窗口
         msg_item.click_input()
         time.sleep(1.5)
-        # 找"收款"按钮：先试 main_window（详情可能是 modal 子窗口），再试 Desktop（独立弹出）
-        btn = main_window.child_window(title="收款", control_type="Button")
-        if not btn.exists(timeout=1):
-            desktop = Desktop(backend='uia')
-            btn = desktop.window(title="收款", control_type="Button")
-        if not btn.exists(timeout=1):
-            btn = main_window.child_window(title_re=".*收款.*", control_type="Button")
-        if not btn.exists(timeout=1):
-            log.info(f"[转账收款] {chat} 未找到收款按钮，dump 详情窗口结构:")
+        # 详情窗口是独立弹出，UIA 找不到"收款"按钮（mmui 自绘），用坐标点击
+        desktop = Desktop(backend='uia')
+        detail = None
+        for w in desktop.windows():
             try:
-                for w in Desktop(backend='uia').windows():
-                    cn = w.element_info.class_name or ''
+                if not w.is_visible():
+                    continue
+                cn = w.element_info.class_name or ''
+                if cn and cn != 'mmui::MainWindow':
+                    detail = w
+                    break
+            except Exception:
+                continue
+        if not detail:
+            log.warning(f"[转账收款] {chat} 详情窗口未弹出")
+            return False
+        r = detail.rectangle()
+        log.info(f"[转账收款] 详情窗口 rect=({r.left},{r.top},{r.right},{r.bottom})")
+        click_x = (r.left + r.right) // 2
+        # "收款"按钮在窗口下半部，mmui 自绘 UIA 不可见，用坐标循环点击尝试
+        for offset in range(80, 500, 20):  # bottom-80 到 bottom-480，逐步上移
+            click_y = r.bottom - offset
+            pyautogui.click(click_x, click_y)
+            time.sleep(1.0)
+            # 点中"收款"会弹出确认框，检测是否有新的 mmui 弹出窗口
+            desktop2 = Desktop(backend='uia')
+            for w in desktop2.windows():
+                try:
                     if not w.is_visible():
                         continue
-                    if cn.startswith('mmui::') and cn != 'mmui::MainWindow':
-                        log.info(f"  窗口 class={cn} title={w.window_text()[:30]!r} rect={w.rectangle()}")
-                        for d in w.descendants():
-                            t = (d.window_text() or '').replace('\n', ' ')[:30]
-                            if t:
-                                log.info(f"    [{d.control_type}] class={d.class_name()} text={t!r}")
-            except Exception as de:
-                log.warning(f"[转账诊断] dump 异常: {de}")
-            pyautogui.press('esc')
-            return False
-        btn.click_input()
-        time.sleep(1)
-        # 确认弹框（"确认收下"）
-        desktop = Desktop(backend='uia')
-        confirm = main_window.child_window(title="确认收下", control_type="Button")
-        if not confirm.exists(timeout=1):
-            confirm = desktop.window(title="确认收下", control_type="Button")
-        if not confirm.exists(timeout=1):
-            confirm = main_window.child_window(title_re=".*确认.*|.*收下.*", control_type="Button")
-        if confirm.exists(timeout=0.5):
-            confirm.click_input()
-            time.sleep(0.5)
-            return True
+                    wcn = w.element_info.class_name or ''
+                    if wcn.startswith('mmui::') and wcn != 'mmui::MainWindow' and wcn != cn:
+                        # 新弹出窗口 = 确认框，点击其中心确认
+                        cr = w.rectangle()
+                        log.info(f"[转账收款] 确认弹窗 rect=({cr.left},{cr.top},{cr.right},{cr.bottom})")
+                        pyautogui.click((cr.left + cr.right) // 2, (cr.top + cr.bottom) // 2)
+                        time.sleep(0.5)
+                        log.info(f"[转账收款] 收款成功: {chat} (offset={offset})")
+                        return True
+                except Exception:
+                    continue
+        log.warning(f"[转账收款] {chat} 循环点击未命中收款按钮")
+        pyautogui.press('esc')
         return False
     except Exception as e:
         log.warning(f"[转账收款] 异常: {chat} -> {e}")
+        try:
+            pyautogui.press('esc')
+        except Exception:
+            pass
+        return False
+
+
+def _open_red_packet(main_window, msg_item, chat: str) -> bool:
+    """拆开好友红包。点击红包消息 → 详情窗口弹出 → 坐标点击"开"按钮。"""
+    from pywinauto import Desktop
+    try:
+        msg_item.click_input()
+        time.sleep(1.5)
+        desktop = Desktop(backend='uia')
+        detail = None
+        for w in desktop.windows():
+            try:
+                if not w.is_visible():
+                    continue
+                cn = w.element_info.class_name or ''
+                if cn and cn != 'mmui::MainWindow':
+                    detail = w
+                    break
+            except Exception:
+                continue
+        if not detail:
+            log.warning(f"[红包] {chat} 详情窗口未弹出")
+            return False
+        r = detail.rectangle()
+        log.info(f"[红包] 详情窗口 rect=({r.left},{r.top},{r.right},{r.bottom})")
+        click_x = (r.left + r.right) // 2
+        # "开"按钮在窗口中心偏下（金币图标下方），循环点击尝试
+        for offset in range(100, 500, 20):
+            click_y = r.bottom - offset
+            pyautogui.click(click_x, click_y)
+            time.sleep(0.5)
+            # 拆开后窗口内容变化（金额显示），检查是否有新窗口/内容变化
+            # 简单检测：点中"开"后详情窗口可能关闭或变化
+            still_detail = False
+            for w in desktop.windows():
+                try:
+                    if w.is_visible() and (w.element_info.class_name or '') == cn:
+                        still_detail = True
+                        break
+                except Exception:
+                    continue
+            if not still_detail:
+                log.info(f"[红包] 拆开成功(offset={offset})")
+                return True
+        log.warning(f"[红包] {chat} 循环点击未命中开按钮")
+        pyautogui.press('esc')
+        return False
+    except Exception as e:
+        log.warning(f"[红包] 异常: {chat} -> {e}")
         try:
             pyautogui.press('esc')
         except Exception:
@@ -351,6 +411,18 @@ def _process_one(main_window, chat: str, sender: str, text: str,
                     content=f"已确认收款\n来源: {chat}\n时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
             except Exception as e:
                 log.warning(f"[转账收款] 飞书提醒失败: {e}")
+
+    # 红包自动拆开（收到红包 → 点"开" → 飞书提醒）
+    if msg_type == "微信红包" and bot_config.get("auto_open_red_packet", False) and msg_item is not None:
+        if _open_red_packet(main_window, msg_item, chat):
+            log.info(f"[红包] 已拆开: {chat}")
+            try:
+                from . import webhook_send
+                webhook_send.send_webhook(
+                    title=f"【红包拆开】{chat}",
+                    content=f"已拆开红包\n来源: {chat}\n时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            except Exception as e:
+                log.warning(f"[红包] 飞书提醒失败: {e}")
 
     # 群消息关键词监控(命中 → 点头像读真实发送人 → 转发;独立于监听白名单)
     # 不依赖 is_group:match_group_monitor 自带群匹配,私聊/非配置群直接返回 False

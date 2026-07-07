@@ -51,6 +51,8 @@ DEFAULTS: dict[str, Any] = {
     "group_monitor_list": [],  # [{"group":"群名","keywords":["车找人"],"forward_to":["文件传输助手"]}]
     # 转账自动收款（收到好友转账 → 自动确认收款 → 飞书提醒）
     "auto_collect_transfer": False,
+    # 红包自动拆开（收到红包 → 自动点"开" → 飞书提醒）
+    "auto_open_red_packet": False,
     # 新好友
     "new_friend_switch": False,
     "new_friend_reply_switch": False,
