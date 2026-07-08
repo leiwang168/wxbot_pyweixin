@@ -25,9 +25,11 @@ if os.environ.get("PYTHONUTF8") != "1":
     print("⚠️  建议先设置环境变量: set PYTHONUTF8=1 （中文/emoji 输出更稳）")
 
 # pyweixin SDK 已内嵌为本项目本地包（./pyweixin/），确保项目根目录在 sys.path 最前
-_HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
+# PyInstaller 打包后跳过（自动处理包导入）
+if not getattr(sys, 'frozen', False):
+    _HERE = os.path.dirname(os.path.abspath(__file__))
+    if _HERE not in sys.path:
+        sys.path.insert(0, _HERE)
 
 from pyweixin import Tools, Contacts  # noqa: E402
 from pyweixin.Config import GlobalConfig  # noqa: E402

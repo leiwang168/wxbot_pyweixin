@@ -28,10 +28,10 @@ from .executor import TaskExecutor
 from .identity import WorkerIdentity
 from .resolver import ContactResolver
 
-_CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-    os.path.abspath(__file__)))), "config", "config.json")
-_OPERATE_CACHE_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-    os.path.abspath(__file__)))), "config", "operate_cache.json")
+from ..paths import get_config_dir
+
+_CONFIG_PATH = os.path.join(get_config_dir(), "config.json")
+_OPERATE_CACHE_PATH = os.path.join(get_config_dir(), "operate_cache.json")
 
 
 def _patch_open_friend_profile():

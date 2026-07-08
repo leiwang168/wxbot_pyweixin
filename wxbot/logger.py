@@ -8,7 +8,9 @@ import sys
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 
-_LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+from .paths import get_logs_dir
+
+_LOG_DIR = get_logs_dir()
 
 
 def _build_logger() -> logging.Logger:

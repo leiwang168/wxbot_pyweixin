@@ -18,10 +18,10 @@ from typing import Optional
 
 from pyweixin import Contacts
 
+from ..paths import get_config_dir
 from .common import emit
 
-_CACHE_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-    os.path.abspath(__file__)))), "config", "contacts_cache.json")
+_CACHE_PATH = os.path.join(get_config_dir(), "contacts_cache.json")
 
 
 @dataclass

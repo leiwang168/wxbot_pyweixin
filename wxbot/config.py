@@ -12,8 +12,9 @@ import threading
 from typing import Any
 
 from .logger import log
+from .paths import get_config_path
 
-_CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config", "config.json")
+_CONFIG_PATH = get_config_path()
 
 
 # ---------------------------------------------------------------------------
