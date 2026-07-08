@@ -697,6 +697,7 @@ class Monitor:
                 log.error(f"[新好友通过] 模拟转发 {m} 失败: {e}")
 
     def loop(self) -> None:
+        self._stop.clear()  # 重置停止标志，支持 stop() 后再次启动
         self.check_interval = float(bot_config.get("monitor_check_interval", 10) or 10)
         self._run_timeout = float(bot_config.get("monitor_run_timeout", 30) or 30)
         log.info(f"📨 消息主循环启动（轮询间隔 {self.check_interval}s，单轮超时 {self._run_timeout}s）")
