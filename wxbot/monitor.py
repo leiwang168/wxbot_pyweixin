@@ -545,9 +545,14 @@ class Monitor:
             log.info("UI 锁被占用，跳过本轮消息轮询")
             return
         input_blocker.set_bot_active(True)  # 放行机器人点击
+        # 标记 monitor 正在处理消息（检测→转发MQTT），executor 应等待完成后再操作UI
+        if mqtt_worker._wx_busy_event:
+            mqtt_worker._wx_busy_event.set()
         try:
             self._run_once_locked()
         finally:
+            if mqtt_worker._wx_busy_event:
+                mqtt_worker._wx_busy_event.clear()
             input_blocker.set_bot_active(False)
             if ui_lock:
                 try:

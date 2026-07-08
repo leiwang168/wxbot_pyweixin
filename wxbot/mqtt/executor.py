@@ -61,8 +61,13 @@ class TaskExecutor:
         self._forwarded_lock = threading.Lock()
 
     def _enter_ui(self) -> None:
-        """获取 UI 锁 + 重置微信到聊天主页，确保后续操作从干净状态开始。"""
+        """获取 UI 锁 + 重置微信到聊天主页，确保后续操作从干净状态开始。
+        若 monitor 正在处理消息（wx_busy），先等其完成再获取锁，避免打断消息检测→转发流程。"""
         self._ui_lock_acquired = False
+        # 等待 monitor 完成当前消息处理周期（检测→转发MQTT）
+        if self._wx_busy_event and self._wx_busy_event.is_set():
+            self._log("INFO", "等待 monitor 完成当前消息处理...")
+            self._wx_busy_event.wait(timeout=60)  # 最多等60秒
         if self._ui_lock:
             if not self._ui_lock.acquire(timeout=30):
                 raise RuntimeError("UI 锁获取超时 (30s)，可能有残留任务占用")

@@ -289,7 +289,8 @@ class MqttCoordinator:
                 result = {"correlationId": cid, "status": "error",
                           "result": {"error": f"任务执行异常: {e}"}}
         finally:
-            self._wx_busy_event.clear()
+            # wx_busy 由 executor _enter_ui/_exit_ui 内部管理，不在此清除
+            pass
 
         with self._lock:
             self._task_count += 1
