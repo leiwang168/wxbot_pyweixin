@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import OrderedDict
 from typing import Optional
 
 import pyautogui
@@ -185,7 +186,7 @@ def _confirm_transfer(main_window, msg_item, chat: str) -> bool:
     """确认收款好友转账。返回是否收款成功。
 
     转账消息文本含"待你收款"（待收款状态）。点击转账消息弹出独立详情窗口 →
-    在 Desktop 中找"确认收款"按钮 → 点击 → 确认弹框。
+    坐标循环点击"收款"按钮 → 检测确认弹窗 → 点击确认。
     """
     from pywinauto import Desktop
     try:
@@ -195,13 +196,16 @@ def _confirm_transfer(main_window, msg_item, chat: str) -> bool:
         # 详情窗口是独立弹出，UIA 找不到"收款"按钮（mmui 自绘），用坐标点击
         desktop = Desktop(backend='uia')
         detail = None
+        detail_cn = ''
         for w in desktop.windows():
             try:
                 if not w.is_visible():
                     continue
                 cn = w.element_info.class_name or ''
-                if cn and cn != 'mmui::MainWindow':
+                # 只匹配 mmui:: 开头的窗口，避免误选浏览器/记事本等
+                if cn.startswith('mmui::') and cn != 'mmui::MainWindow':
                     detail = w
+                    detail_cn = cn
                     break
             except Exception:
                 continue
@@ -212,12 +216,32 @@ def _confirm_transfer(main_window, msg_item, chat: str) -> bool:
         log.info(f"[转账收款] 详情窗口 rect=({r.left},{r.top},{r.right},{r.bottom})")
         click_x = (r.left + r.right) // 2
         # "收款"按钮在窗口下半部，mmui 自绘 UIA 不可见，用坐标循环点击尝试
-        for offset in range(120, 300, 20):  # bottom-120 到 bottom-280，逐步上移
+        for offset in range(80, 500, 20):  # bottom-80 到 bottom-480，逐步上移
             click_y = r.bottom - offset
             pyautogui.click(click_x, click_y)
             time.sleep(1.0)
+            # 点中"收款"会弹出确认框，检测是否有新的 mmui 弹出窗口
+            try:
+                for w2 in Desktop(backend='uia').windows():
+                    try:
+                        if not w2.is_visible():
+                            continue
+                        wcn = w2.element_info.class_name or ''
+                        if wcn.startswith('mmui::') and wcn != 'mmui::MainWindow' and wcn != detail_cn:
+                            # 新弹出窗口 = 确认框，点击其中心确认
+                            cr = w2.rectangle()
+                            log.info(f"[转账收款] 确认弹窗 rect=({cr.left},{cr.top},{cr.right},{cr.bottom})")
+                            pyautogui.click((cr.left + cr.right) // 2, (cr.top + cr.bottom) // 2)
+                            time.sleep(0.5)
+                            log.info(f"[转账收款] 收款成功: {chat} (offset={offset})")
+                            return True
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+        log.warning(f"[转账收款] {chat} 循环点击未命中收款按钮")
         pyautogui.press('esc')
-        return True
+        return False
     except Exception as e:
         log.warning(f"[转账收款] 异常: {chat} -> {e}")
         try:
@@ -243,14 +267,20 @@ def _open_red_packet(main_window, msg_item, chat: str) -> bool:
         center_y = (r.top + r.bottom) // 2
         log.info(f"[红包] 聊天区域 rect=({r.left},{r.top},{r.right},{r.bottom}) 中心=({center_x},{center_y})")
         # "开"按钮在中心点偏下，逐步下移点击尝试
+        clicked = False
         for offset in range(200, 300, 20):
             click_y = center_y + offset
             if click_y >= r.bottom:
                 break
             log.info(f"[红包] 尝试点击 ({center_x}, {click_y}) offset=+{offset}")
             pyautogui.click(center_x, click_y)
+            clicked = True
             time.sleep(0.5)
-        log.info(f"[红包] 点击完成(offset=+{offset})，按Esc退出")
+        if not clicked:
+            log.warning(f"[红包] {chat} 聊天区域太小，无法点击开按钮")
+            pyautogui.press('esc')
+            return False
+        log.info(f"[红包] 点击完成，按Esc退出")
         pyautogui.press('esc')
         return True
     except Exception as e:
@@ -345,9 +375,9 @@ def _process_one(main_window, chat: str, sender: str, text: str,
     # /指令（仅 admin，不受监听过滤限制）
     if text.startswith("/") and commands.is_admin(sender):
         reply = commands.handle(text)
+        processed.add(f"{chat}:CMD:{text}")  # 无论是否有回复都去重，避免每轮重复执行
         if reply:
             _send_to_chat(main_window, chat, split_long_text(reply), current_friend)
-            processed.add(f"{chat}:CMD:{text}")
         return
 
     msg_id = f"{chat}:{msg_type}:{text}"
@@ -475,13 +505,31 @@ def _group_monitor_forward(main_window, chat: str, sender: str, text: str,
 # ---------------------------------------------------------------------------
 # 主循环
 # ---------------------------------------------------------------------------
+class _BoundedSet:
+    """大小受限的去重集合，基于 OrderedDict 实现 LRU 淘汰。"""
+    def __init__(self, maxsize: int = 5000) -> None:
+        self._data: OrderedDict[str, None] = OrderedDict()
+        self._maxsize = maxsize
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._data
+
+    def add(self, key: str) -> None:
+        if key in self._data:
+            self._data.move_to_end(key)  # 刷新为最近使用
+        else:
+            self._data[key] = None
+            if len(self._data) > self._maxsize:
+                self._data.popitem(last=False)  # 淘汰最早的
+
+
 class Monitor:
     def __init__(self, check_interval: float = 10.0) -> None:
         self.check_interval = check_interval
         self._run_timeout = 30.0
         self._stop = threading.Event()
         self._last_loop_alert = ("", 0.0)  # (异常文本, 时间戳)，节流防刷屏
-        self.processed: set[str] = set()
+        self.processed: _BoundedSet = _BoundedSet(maxsize=5000)
         self.current_friend: Optional[str] = None
         self.current_last_rid = None
         self._first_run = True

@@ -681,7 +681,7 @@ class MqttWorkerExtension:
                 return None
             last = items[-1]
             r = last.rectangle()
-            # 右键坐标偏移到组件最左侧+80（点中图片缩略图，避免小图片点空）
+            # 右键坐标偏移到组件最左侧+200（点中图片缩略图，避免小图片点空）
             mouse.right_click(coords=(r.left + 200, (r.top + r.bottom) // 2))
             time.sleep(0.5)
             copy_item = mw.child_window(**MenuItems.CopyMenuItem)
@@ -699,14 +699,13 @@ class MqttWorkerExtension:
                     emit("INFO", f"图片右键复制保存: {file_name} ({file_size} bytes) url={file_url}")
                     try:
                         os.remove(path)
-                        os.rmdir(temp_dir)
                     except OSError:
                         pass
                     return (file_name, file_size, file_url)
                 copied = True
             # 复制失败 → esc 关菜单 + 截图兜底
-            # if not copied:
-            #     pyautogui.press('esc')
+            pyautogui.press('esc')
+            time.sleep(0.3)
             tmp = os.path.join(temp_dir, f"img_{int(time.time()*1000)}.png")
             pyautogui.screenshot().crop((r.left, r.top, r.right, r.bottom)).save(tmp)
             file_name = os.path.basename(tmp)
@@ -717,7 +716,6 @@ class MqttWorkerExtension:
             emit("INFO", f"图片截图兜底: {file_name} ({file_size} bytes) url={file_url}")
             try:
                 os.remove(tmp)
-                os.rmdir(temp_dir)
             except OSError:
                 pass
             return (file_name, file_size, file_url)
@@ -727,11 +725,13 @@ class MqttWorkerExtension:
                 pyautogui.press('esc')
             except Exception:
                 pass
+            return None
+        finally:
+            # 确保临时目录总是被清理
             try:
                 os.rmdir(temp_dir)
             except OSError:
                 pass
-            return None
 
 
 # 全局单例
