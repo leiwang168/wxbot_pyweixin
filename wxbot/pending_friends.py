@@ -14,8 +14,9 @@ import os
 import threading
 import time
 
-_PENDING_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                             "config", "pending_friends.json")
+from .paths import get_config_dir
+
+_PENDING_PATH = os.path.join(get_config_dir(), "pending_friends.json")
 _EXPIRE_SECONDS = 7 * 24 * 3600  # 超过 7 天的标记视为过期(对方未通过)
 _lock = threading.Lock()
 

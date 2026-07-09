@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import OrderedDict
 from typing import Optional
 
 import pyautogui
@@ -185,14 +186,20 @@ def _confirm_transfer(main_window, msg_item, chat: str) -> bool:
     """确认收款好友转账。返回是否收款成功。
 
     转账消息文本含"待你收款"（待收款状态）。点击转账消息弹出独立详情窗口 →
-    在 Desktop 中找"确认收款"按钮 → 点击 → 确认弹框。
+    OpenCV 模板匹配定位"收款"按钮 → 点击收款 → Esc 关闭结果弹窗。
     """
+    import cv2
+    import numpy as np
+    import os as _os
     from pywinauto import Desktop
+    from PIL import ImageGrab
+    from .paths import get_images_dir
+    _TEMPLATE_DIR = get_images_dir()
     try:
         # 点击转账消息打开详情窗口
         msg_item.click_input()
         time.sleep(1.5)
-        # 详情窗口是独立弹出，UIA 找不到"收款"按钮（mmui 自绘），用坐标点击
+        # 详情窗口是独立弹出
         desktop = Desktop(backend='uia')
         detail = None
         for w in desktop.windows():
@@ -200,7 +207,7 @@ def _confirm_transfer(main_window, msg_item, chat: str) -> bool:
                 if not w.is_visible():
                     continue
                 cn = w.element_info.class_name or ''
-                if cn and cn != 'mmui::MainWindow':
+                if cn.startswith('mmui::') and cn != 'mmui::MainWindow':
                     detail = w
                     break
             except Exception:
@@ -210,13 +217,40 @@ def _confirm_transfer(main_window, msg_item, chat: str) -> bool:
             return False
         r = detail.rectangle()
         log.info(f"[转账收款] 详情窗口 rect=({r.left},{r.top},{r.right},{r.bottom})")
-        click_x = (r.left + r.right) // 2
-        # "收款"按钮在窗口下半部，mmui 自绘 UIA 不可见，用坐标循环点击尝试
-        for offset in range(120, 300, 20):  # bottom-120 到 bottom-280，逐步上移
-            click_y = r.bottom - offset
-            pyautogui.click(click_x, click_y)
-            time.sleep(1.0)
+
+        # OpenCV 模板匹配定位"收款"按钮
+        collect_template = cv2.imread(_os.path.join(_TEMPLATE_DIR, 'shoukuan_btn.png'),
+                                      cv2.IMREAD_COLOR)
+        if collect_template is None:
+            log.warning("[转账收款] 收款按钮模板图不存在")
+            pyautogui.press('esc')
+            return False
+
+        # 截取详情窗口区域，模板匹配找"收款"按钮
+        shot_pil = ImageGrab.grab(bbox=(r.left, r.top, r.right, r.bottom))
+        shot = cv2.cvtColor(np.array(shot_pil), cv2.COLOR_RGB2BGR)
+        th, tw = collect_template.shape[:2]
+        if shot.shape[0] < th or shot.shape[1] < tw:
+            log.warning(f"[转账收款] 详情窗口截图({shot.shape})小于模板({collect_template.shape})")
+            pyautogui.press('esc')
+            return False
+        res = cv2.matchTemplate(shot, collect_template, cv2.TM_CCOEFF_NORMED)
+        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+        log.info(f"[转账收款] 模板匹配置信度={max_val:.3f} 位置={max_loc}")
+        if max_val < 0.6:
+            log.warning(f"[转账收款] 未匹配到收款按钮(置信度{max_val:.3f}<0.6)")
+            pyautogui.press('esc')
+            return False
+
+        # 点击"收款"按钮（max_loc 是模板左上角在截图中的位置，转为屏幕坐标）
+        click_x = r.left + max_loc[0] + tw // 2
+        click_y = r.top + max_loc[1] + th // 2
+        log.info(f"[转账收款] 点击收款按钮 ({click_x}, {click_y})")
+        pyautogui.click(click_x, click_y)
+        time.sleep(3)
+        # 收款成功后弹出结果提示（"你已收款,资金已存入零钱"），Esc 关闭
         pyautogui.press('esc')
+        log.info(f"[转账收款] 收款成功: {chat}")
         return True
     except Exception as e:
         log.warning(f"[转账收款] 异常: {chat} -> {e}")
@@ -226,41 +260,126 @@ def _confirm_transfer(main_window, msg_item, chat: str) -> bool:
             pass
         return False
 
+def _open_red_packet(main_window, msg_item, chat: str) -> str | None:
+    """拆开好友红包。返回截图 URL（服务端识别金额），失败返回 None。
 
-def _open_red_packet(main_window, msg_item, chat: str) -> bool:
-    """拆开好友红包。点击红包消息 → 聊天对话区域中心弹出红包详情 → 从中心向下点"开"按钮。"""
+    点击红包消息 → OpenCV 模板匹配定位"开"按钮 → 点击拆开 →
+    截图上传 MinIO → 转发 MQTT → Esc 关闭。
+    """
+    import cv2
+    import numpy as np
+    import os as _os
+    import tempfile
+    from pywinauto import Desktop
+    from PIL import ImageGrab
+    from .paths import get_images_dir
+    _TEMPLATE_DIR = get_images_dir()
     try:
         # 点击红包消息，红包详情会显示在聊天对话区域正中心
         msg_item.click_input()
         time.sleep(1.5)
-        # 以聊天消息列表区域（FriendChatList）中心为基准
+        # 以聊天消息列表区域（FriendChatList）为截图区域
         chat_list = main_window.child_window(**Lists.FriendChatList)
         if not chat_list.exists(timeout=1):
-            log.warning(f"[红包] {chat} 找不到聊天消息列表")
-            return False
+            log.warning(f"[微信红包] {chat} 找不到聊天消息列表")
+            return None
         r = chat_list.rectangle()
-        center_x = (r.left + r.right) // 2
-        center_y = (r.top + r.bottom) // 2
-        log.info(f"[红包] 聊天区域 rect=({r.left},{r.top},{r.right},{r.bottom}) 中心=({center_x},{center_y})")
-        # "开"按钮在中心点偏下，逐步下移点击尝试
-        for offset in range(200, 300, 20):
-            click_y = center_y + offset
-            if click_y >= r.bottom:
-                break
-            log.info(f"[红包] 尝试点击 ({center_x}, {click_y}) offset=+{offset}")
-            pyautogui.click(center_x, click_y)
-            time.sleep(0.5)
-        log.info(f"[红包] 点击完成(offset=+{offset})，按Esc退出")
+        log.info(f"[微信红包] 聊天区域 rect=({r.left},{r.top},{r.right},{r.bottom})")
+
+        # OpenCV 模板匹配定位"开"按钮
+        open_template = cv2.imread(_os.path.join(_TEMPLATE_DIR, 'hongbao_btn.png'),
+                                   cv2.IMREAD_COLOR)
+        if open_template is None:
+            log.warning("[微信红包] 开按钮模板图不存在")
+            pyautogui.press('esc')
+            return None
+
+        # 截取聊天区域，模板匹配找"开"按钮
+        shot_pil = ImageGrab.grab(bbox=(r.left, r.top, r.right, r.bottom))
+        shot = cv2.cvtColor(np.array(shot_pil), cv2.COLOR_RGB2BGR)
+        th, tw = open_template.shape[:2]
+        if shot.shape[0] < th or shot.shape[1] < tw:
+            log.warning(f"[微信红包] 聊天区域截图({shot.shape})小于模板({open_template.shape})")
+            pyautogui.press('esc')
+            return None
+        res = cv2.matchTemplate(shot, open_template, cv2.TM_CCOEFF_NORMED)
+        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+        log.info(f"[微信红包] 模板匹配置信度={max_val:.3f} 位置={max_loc}")
+        if max_val < 0.6:
+            log.warning(f"[微信红包] 未匹配到开按钮(置信度{max_val:.3f}<0.6)")
+            pyautogui.press('esc')
+            return None
+
+        # 点击"开"按钮（max_loc 是模板左上角在截图中的位置，转为屏幕坐标）
+        click_x = r.left + max_loc[0] + tw // 2
+        click_y = r.top + max_loc[1] + th // 2
+        log.info(f"[微信红包] 点击开按钮 ({click_x}, {click_y})")
+        pyautogui.click(click_x, click_y)
+        time.sleep(3)
+
+        # 拆开后截图：优先截 PayRedEnvelopDetailWindow，否则截聊天区域
+        screenshot_url = None
+        try:
+            desktop = Desktop(backend='uia')
+            detail_win = desktop.window(class_name='mmui::PayRedEnvelopDetailWindow',
+                                        control_type='Window')
+            if detail_win.exists(timeout=3):
+                wr = detail_win.rectangle()
+            else:
+                wr = r
+            # 截图保存到临时文件（文件名不含 chat，避免昵称含非法字符导致保存失败）
+            tmp = _os.path.join(tempfile.gettempdir(), f'hongbao_{int(time.time())}.png')
+            ImageGrab.grab(bbox=(wr.left, wr.top, wr.right, wr.bottom)).save(tmp)
+            log.info(f"[微信红包] 截图已保存: {tmp}")
+            # 上传 MinIO（失败返回 None，让调用方回退到文本转发）
+            uploader = mqtt_worker._uploader if mqtt_worker._coordinator else None
+            if uploader and getattr(uploader, 'available', False):
+                result = uploader.upload(tmp, chat=chat)
+                screenshot_url = result if result else None
+                if screenshot_url:
+                    log.info(f"[微信红包] 截图已上传: {screenshot_url}")
+                else:
+                    log.warning("[微信红包] 截图上传失败，回退文本转发")
+            else:
+                log.warning("[微信红包] MinIO 未配置，截图未上传")
+            # 清理临时文件
+            try:
+                _os.remove(tmp)
+            except OSError:
+                pass
+            if detail_win.exists(timeout=0.5):
+                try:
+                    detail_win.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            log.warning(f"[微信红包] 截图上传异常: {e}")
+
+        # 确保关闭所有红包相关弹窗
         pyautogui.press('esc')
-        return True
+        time.sleep(0.3)
+
+        # 转发 MQTT：红包拆开 + 截图 URL
+        if screenshot_url:
+            try:
+                mqtt_worker.on_wechat_message(
+                    chat, chat, "[微信红包已查收]",
+                    msg_type="微信红包",
+                    file_url=screenshot_url,
+                    file_name=f"hongbao_{chat}.png")
+                log.info(f"[微信红包] 截图已转发MQTT: {chat}")
+            except Exception as e:
+                log.warning(f"[微信红包] MQTT转发失败: {e}")
+
+        log.info(f"[微信红包] 拆开成功: {chat} 截图URL={screenshot_url}")
+        return screenshot_url
     except Exception as e:
-        log.warning(f"[红包] 异常: {chat} -> {e}")
+        log.warning(f"[微信红包] 异常: {chat} -> {e}")
         try:
             pyautogui.press('esc')
         except Exception:
             pass
-        return False
-
+        return None
 
 def _clear_pending_if_match(name: str, sender: str = None,
                              text: str = None, msg_type: str = None) -> bool:
@@ -345,9 +464,9 @@ def _process_one(main_window, chat: str, sender: str, text: str,
     # /指令（仅 admin，不受监听过滤限制）
     if text.startswith("/") and commands.is_admin(sender):
         reply = commands.handle(text)
+        processed.add(f"{chat}:CMD:{text}")  # 无论是否有回复都去重，避免每轮重复执行
         if reply:
             _send_to_chat(main_window, chat, split_long_text(reply), current_friend)
-            processed.add(f"{chat}:CMD:{text}")
         return
 
     msg_id = f"{chat}:{msg_type}:{text}"
@@ -375,17 +494,21 @@ def _process_one(main_window, chat: str, sender: str, text: str,
             except Exception as e:
                 log.warning(f"[转账收款] 飞书提醒失败: {e}")
 
-    # 红包自动拆开（收到红包 → 点"开" → 飞书提醒）
+    # 红包自动拆开（收到红包 → 点"开" → 截图上传 → MQTT转发 → 飞书提醒）
+    # 截图转发成功后直接返回，不再发红包文本消息
     if msg_type == "微信红包" and bot_config.get("auto_open_red_packet", False) and msg_item is not None:
-        if _open_red_packet(main_window, msg_item, chat):
-            log.info(f"[红包] 已拆开: {chat}")
+        screenshot_url = _open_red_packet(main_window, msg_item, chat)
+        if screenshot_url is not None:
+            log.info(f"[微信红包] 已拆开: {chat} 截图={screenshot_url}")
             try:
                 from . import webhook_send
+                url_line = f"\n截图: {screenshot_url}" if screenshot_url else ""
                 webhook_send.send_webhook(
-                    title=f"【红包拆开】{chat}",
-                    content=f"已拆开红包\n来源: {chat}\n时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                    title=f"【微信红包】{chat}",
+                    content=f"已拆开红包{url_line}\n来源: {chat}\n时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
             except Exception as e:
-                log.warning(f"[红包] 飞书提醒失败: {e}")
+                log.warning(f"[微信红包] 飞书提醒失败: {e}")
+            return
 
     # 群消息关键词监控(命中 → 点头像读真实发送人 → 转发;独立于监听白名单)
     # 不依赖 is_group:match_group_monitor 自带群匹配,私聊/非配置群直接返回 False
@@ -475,17 +598,36 @@ def _group_monitor_forward(main_window, chat: str, sender: str, text: str,
 # ---------------------------------------------------------------------------
 # 主循环
 # ---------------------------------------------------------------------------
+class _BoundedSet:
+    """大小受限的去重集合，基于 OrderedDict 实现 LRU 淘汰。"""
+    def __init__(self, maxsize: int = 5000) -> None:
+        self._data: OrderedDict[str, None] = OrderedDict()
+        self._maxsize = maxsize
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._data
+
+    def add(self, key: str) -> None:
+        if key in self._data:
+            self._data.move_to_end(key)  # 刷新为最近使用
+        else:
+            self._data[key] = None
+            if len(self._data) > self._maxsize:
+                self._data.popitem(last=False)  # 淘汰最早的
+
+
 class Monitor:
     def __init__(self, check_interval: float = 10.0) -> None:
         self.check_interval = check_interval
         self._run_timeout = 30.0
         self._stop = threading.Event()
         self._last_loop_alert = ("", 0.0)  # (异常文本, 时间戳)，节流防刷屏
-        self.processed: set[str] = set()
+        self.processed: _BoundedSet = _BoundedSet(maxsize=5000)
         self.current_friend: Optional[str] = None
         self.current_last_rid = None
         self._first_run = True
         self._last_pending_scan = 0.0  # 待通过好友扫描节流时间戳
+        self._lock_fail_count = 0  # UI 锁连续获取失败计数
 
     def stop(self) -> None:
         self._stop.set()
@@ -494,12 +636,37 @@ class Monitor:
         # 获取 UI 互斥锁：与 MQTT 任务/异步媒体线程互斥，避免抢鼠标
         ui_lock = mqtt_worker.ui_lock
         if ui_lock and not ui_lock.acquire(timeout=0.5):
-            log.info("UI 锁被占用，跳过本轮消息轮询")
+            self._lock_fail_count += 1
+            # 连续失败超过阈值（约 2 分钟）→ 重建锁，恢复 monitor 轮询
+            if self._lock_fail_count >= 12:
+                log.warning(f"UI 锁连续 {self._lock_fail_count} 轮获取失败，重建锁恢复轮询")
+                try:
+                    new_lock = threading.Lock()
+                    coord = mqtt_worker._coordinator
+                    if coord:
+                        coord._ui_lock = new_lock
+                        if coord._executor:
+                            coord._executor._ui_lock = new_lock
+                        else:
+                            log.warning("重建UI锁时 executor 为 None，互斥可能短暂失效")
+                    self._lock_fail_count = 0
+                except Exception as e:
+                    log.error(f"重建 UI 锁失败: {e}")
+            elif self._lock_fail_count == 1 or self._lock_fail_count % 6 == 0:
+                # 节流日志：首次 + 每约 1 分钟
+                log.info(f"UI 锁被占用，已连续跳过 {self._lock_fail_count} 轮")
             return
+        self._lock_fail_count = 0  # 成功获取，重置
         input_blocker.set_bot_active(True)  # 放行机器人点击
+        # 标记 monitor 正在处理消息（检测→转发MQTT），executor 应等待完成后再操作UI
+        wx_busy_event = getattr(mqtt_worker._coordinator, '_wx_busy_event', None) if mqtt_worker._coordinator else None
+        if wx_busy_event:
+            wx_busy_event.set()
         try:
             self._run_once_locked()
         finally:
+            if wx_busy_event:
+                wx_busy_event.clear()
             input_blocker.set_bot_active(False)
             if ui_lock:
                 try:
@@ -649,6 +816,7 @@ class Monitor:
                 log.error(f"[新好友通过] 模拟转发 {m} 失败: {e}")
 
     def loop(self) -> None:
+        self._stop.clear()  # 重置停止标志，支持 stop() 后再次启动
         self.check_interval = float(bot_config.get("monitor_check_interval", 10) or 10)
         self._run_timeout = float(bot_config.get("monitor_run_timeout", 30) or 30)
         log.info(f"📨 消息主循环启动（轮询间隔 {self.check_interval}s，单轮超时 {self._run_timeout}s）")

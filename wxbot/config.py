@@ -12,8 +12,9 @@ import threading
 from typing import Any
 
 from .logger import log
+from .paths import get_config_path
 
-_CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config", "config.json")
+_CONFIG_PATH = get_config_path()
 
 
 # ---------------------------------------------------------------------------
@@ -112,9 +113,9 @@ DEFAULTS: dict[str, Any] = {
         "rate_limit_seconds": 60,     # 同一目标限流间隔
         "daily_limit": 20,            # 每日添加上限
         "retry_count": 3,             # 失败重试次数
-        "pre_delay": 3,               # 加好友 UI 操作前延迟（秒），拟人化避免风控
+        "pre_delay": 0,               # 加好友 UI 操作前延迟（秒），0=不延迟
     },
-    "moments_post_pre_delay": 3,      # 发朋友圈 UI 操作前延迟（秒），拟人化避免风控
+    "moments_post_pre_delay": 0,      # 发朋友圈 UI 操作前延迟（秒），0=不延迟
     # ---- MQTT 数字员工（OpenClaw 通道）----
     "mqtt_worker": {
         "enabled": False,             # 默认关闭，需配合 MQTT broker 与 OpenClaw
@@ -145,11 +146,11 @@ DEFAULTS: dict[str, Any] = {
             {
                 "enabled": True,
                 "role": "default",
-                "agent_id": "agent_001",
+                "agent_id": "wx_001",
                 "topics": {
-                    "subscribe": "wxbot/{role}/tasks",
-                    "callback_prefix": "wxbot/callback/{agent_id}",
-                    "forward": "wxbot/{role}/events",
+                    "subscribe": "agent/{role}/{agent_id}",
+                    "callback_prefix": "wechat/{role}/{agent_id}",
+                    "forward": "wechat/{role}/{agent_id}",
                 },
                 "forward_contacts": [],   # 空=兜底转发所有
             }

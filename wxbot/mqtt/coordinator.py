@@ -32,6 +32,7 @@ class MqttCoordinator:
         self._task_fail_count = 0
         self._last_error = ""
         self._started_at = None
+        self._seq = 0  # 递增序列号，避免优先队列比较到 identity 对象
         self._task_timeout = int(self._cfg.get("task_timeout", TASK_TIMEOUT_DEFAULT))
 
         throttle = self._cfg.get("throttle", {}) or {}
@@ -175,7 +176,8 @@ class MqttCoordinator:
             pass
         priority = self._priority_map.get(event_type, TASK_PRIORITY_DEFAULT)
         try:
-            self._task_queue.put_nowait((priority, time.monotonic(), identity, adapted))
+            self._task_queue.put_nowait((priority, self._seq, time.monotonic(), identity, adapted))
+            self._seq += 1
             self._check_queue_alert()
         except queue.Full:
             with self._lock:
@@ -215,7 +217,7 @@ class MqttCoordinator:
                         emit("WARNING", "检测到连接断开")
                         break
                     try:
-                        _, _, identity, payload = self._task_queue.get(timeout=1)
+                        _, _, _, identity, payload = self._task_queue.get(timeout=1)
                         if not self._rate_limiter.acquire(timeout=30):
                             emit("WARNING", "速率限制等待超时，跳过任务")
                             continue
@@ -287,7 +289,8 @@ class MqttCoordinator:
                 result = {"correlationId": cid, "status": "error",
                           "result": {"error": f"任务执行异常: {e}"}}
         finally:
-            self._wx_busy_event.clear()
+            # wx_busy 由 executor _enter_ui/_exit_ui 内部管理，不在此清除
+            pass
 
         with self._lock:
             self._task_count += 1

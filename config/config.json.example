@@ -117,7 +117,7 @@
             "secret_key": "xxxxxx",
             "bucket": "wxbot",
             "secure": true,
-            "public_url_prefix": "D:\\wxbot_pyweixin\\chat_files"
+            "public_url_prefix": ""
         },
         "download_dir": "",
         "workers": [

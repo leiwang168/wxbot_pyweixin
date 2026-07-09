@@ -20,8 +20,9 @@ from typing import Any, Optional, Tuple
 
 import requests
 
-_CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                            "config", "webhook.json")
+from .paths import get_config_dir
+
+_CONFIG_PATH = os.path.join(get_config_dir(), "webhook.json")
 
 
 def default_config() -> dict[str, Any]:
