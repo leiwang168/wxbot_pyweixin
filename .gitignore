@@ -3,13 +3,9 @@ __pycache__/
 logs/
 .venv/
 config/config.json
-config/config.json.bak
+config/webhook.json
 config/contacts_cache.json
 config/operate_cache.json
-config/config - 副本.json
-config/config-wx_05.json
-config/contacts_cache - 副本.json
 config/pending_friends.json
 wxbot_*.log
-*.png
-/config/webhook.json
+
