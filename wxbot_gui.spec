@@ -5,7 +5,10 @@ a = Analysis(
     ['wxbot_gui.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[
+        # 模板图（转账收款/红包拆开按钮）：打包到 _MEIPASS/config/images
+        ('config/images', 'config/images'),
+    ],
     hiddenimports=[
         # pywin32
         'win32gui', 'win32con', 'win32api', 'win32clipboard',
@@ -21,9 +24,10 @@ a = Analysis(
         'paho', 'paho.mqtt', 'paho.mqtt.client',
         # 音频
         'sounddevice', 'soundfile',
-        # 其他
-        'numpy',
+        # 图像处理（模板匹配）
+        'cv2', 'numpy',
         'PIL', 'PIL._tkinter_finder',
+        # 其他
         'emoji',
         'packaging',
         'schedule',

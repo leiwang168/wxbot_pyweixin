@@ -193,7 +193,8 @@ def _confirm_transfer(main_window, msg_item, chat: str) -> bool:
     import os as _os
     from pywinauto import Desktop
     from PIL import ImageGrab
-    _TEMPLATE_DIR = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '..', 'config/images')
+    from .paths import get_images_dir
+    _TEMPLATE_DIR = get_images_dir()
     try:
         # 点击转账消息打开详情窗口
         msg_item.click_input()
@@ -271,7 +272,8 @@ def _open_red_packet(main_window, msg_item, chat: str) -> str | None:
     import tempfile
     from pywinauto import Desktop
     from PIL import ImageGrab
-    _TEMPLATE_DIR = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '..', 'config/images')
+    from .paths import get_images_dir
+    _TEMPLATE_DIR = get_images_dir()
     try:
         # 点击红包消息，红包详情会显示在聊天对话区域正中心
         msg_item.click_input()
@@ -325,15 +327,19 @@ def _open_red_packet(main_window, msg_item, chat: str) -> str | None:
                 wr = detail_win.rectangle()
             else:
                 wr = r
-            # 截图保存到临时文件
-            tmp = _os.path.join(tempfile.gettempdir(), f'hongbao_{chat}_{int(time.time())}.png')
+            # 截图保存到临时文件（文件名不含 chat，避免昵称含非法字符导致保存失败）
+            tmp = _os.path.join(tempfile.gettempdir(), f'hongbao_{int(time.time())}.png')
             ImageGrab.grab(bbox=(wr.left, wr.top, wr.right, wr.bottom)).save(tmp)
             log.info(f"[微信红包] 截图已保存: {tmp}")
-            # 上传 MinIO
+            # 上传 MinIO（失败返回 None，让调用方回退到文本转发）
             uploader = mqtt_worker._uploader if mqtt_worker._coordinator else None
             if uploader and getattr(uploader, 'available', False):
-                screenshot_url = uploader.upload(tmp, chat=chat) or ""
-                log.info(f"[微信红包] 截图已上传: {screenshot_url}")
+                result = uploader.upload(tmp, chat=chat)
+                screenshot_url = result if result else None
+                if screenshot_url:
+                    log.info(f"[微信红包] 截图已上传: {screenshot_url}")
+                else:
+                    log.warning("[微信红包] 截图上传失败，回退文本转发")
             else:
                 log.warning("[微信红包] MinIO 未配置，截图未上传")
             # 清理临时文件
@@ -347,7 +353,7 @@ def _open_red_packet(main_window, msg_item, chat: str) -> str | None:
                 except Exception:
                     pass
         except Exception as e:
-            log.debug(f"[红包] 截图上传异常: {e}")
+            log.warning(f"[微信红包] 截图上传异常: {e}")
 
         # 确保关闭所有红包相关弹窗
         pyautogui.press('esc')
@@ -636,9 +642,13 @@ class Monitor:
                 log.warning(f"UI 锁连续 {self._lock_fail_count} 轮获取失败，重建锁恢复轮询")
                 try:
                     new_lock = threading.Lock()
-                    if mqtt_worker._coordinator:
-                        mqtt_worker._coordinator._ui_lock = new_lock
-                        mqtt_worker._coordinator._executor._ui_lock = new_lock
+                    coord = mqtt_worker._coordinator
+                    if coord:
+                        coord._ui_lock = new_lock
+                        if coord._executor:
+                            coord._executor._ui_lock = new_lock
+                        else:
+                            log.warning("重建UI锁时 executor 为 None，互斥可能短暂失效")
                     self._lock_fail_count = 0
                 except Exception as e:
                     log.error(f"重建 UI 锁失败: {e}")

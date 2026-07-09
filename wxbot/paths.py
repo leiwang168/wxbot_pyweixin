@@ -29,6 +29,16 @@ def get_config_dir() -> str:
     return os.path.join(get_app_dir(), "config")
 
 
+def get_images_dir() -> str:
+    """config/images/ 模板图目录（收款/红包按钮等静态资源）。
+
+    打包后从 _MEIPASS（exe 临时解压目录）读取；开发时从项目根目录读取。
+    """
+    if getattr(sys, 'frozen', False):
+        return os.path.join(sys._MEIPASS, 'config', 'images')
+    return os.path.join(get_app_dir(), 'config', 'images')
+
+
 def get_config_path() -> str:
     """config/config.json 主配置文件路径。"""
     return os.path.join(get_config_dir(), "config.json")
