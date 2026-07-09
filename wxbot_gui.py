@@ -60,8 +60,8 @@ class WxBotApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("wxbot 微信机器人")
-        self.root.geometry("720x600")
-        self.root.minsize(600, 480)
+        self.root.geometry("600x1100")
+        self.root.minsize(600, 800)
 
         self._running = False
         self._start_time: float | None = None

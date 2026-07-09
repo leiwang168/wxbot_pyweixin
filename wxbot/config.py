@@ -146,11 +146,11 @@ DEFAULTS: dict[str, Any] = {
             {
                 "enabled": True,
                 "role": "default",
-                "agent_id": "agent_001",
+                "agent_id": "wx_001",
                 "topics": {
-                    "subscribe": "wxbot/{role}/tasks",
-                    "callback_prefix": "wxbot/callback/{agent_id}",
-                    "forward": "wxbot/{role}/events",
+                    "subscribe": "agent/{role}/{agent_id}",
+                    "callback_prefix": "wechat/{role}/{agent_id}",
+                    "forward": "wechat/{role}/{agent_id}",
                 },
                 "forward_contacts": [],   # 空=兜底转发所有
             }
