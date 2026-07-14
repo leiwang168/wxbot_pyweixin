@@ -272,6 +272,7 @@ class TaskExecutor:
             local_file = self.download_file(file_url)
             if not local_file:
                 return {"status": "error", "error": f"文件下载失败: {file_url[:100]}"}
+        send_error = None
         try:
             self._enter_ui()
             if local_file:
@@ -281,9 +282,13 @@ class TaskExecutor:
                                            close_weixin=False)
                 results.append("file: ok")
             if message and not file_url:
-                Messages.send_messages_to_friend(friend=effective, messages=[message], close_weixin=False)
-                results.append("text: ok")
-            if not results:
+                try:
+                    Messages.send_messages_to_friend(friend=effective, messages=[message], close_weixin=False)
+                    results.append("text: ok")
+                except Exception as e:
+                    send_error = str(e)
+                    self._log("ERROR", f"微信发送消息失败: {e}")
+            if not results and send_error is None:
                 return {"status": "error", "error": "既无 message 也无 fileUrl"}
             self._click_session(effective)
         finally:
@@ -294,6 +299,10 @@ class TaskExecutor:
                     os.remove(local_file)
                 except OSError:
                     pass
+        if send_error:
+            return {"status": "success", "wechatResult": False,
+                    "error": f"微信发送失败: {send_error}",
+                    "wechatRaw": "; ".join(results) if results else ""}
         return {"status": "success", "wechatResult": True, "wechatRaw": "; ".join(results)}
 
     # ---- add_friend ----

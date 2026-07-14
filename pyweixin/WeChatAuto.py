@@ -1997,19 +1997,31 @@ class Files():
                     SystemSettings.copy_text_to_clipboard(message)
                     pyautogui.hotkey('ctrl','v',_pause=False)
                     time.sleep(send_delay)
+                    try:
+                        edit_area.set_focus()#Alt+S 前确保焦点在输入框,避免焦点丢失导致发送无效
+                    except Exception:
+                        pass
                     pyautogui.hotkey('alt','s',_pause=False)
                 if len(message)>2000:
                     SystemSettings.convert_long_text_to_txt(message)
                     pyautogui.hotkey('ctrl','v',_pause=False)
                     time.sleep(send_delay)
+                    try:
+                        edit_area.set_focus()
+                    except Exception:
+                        pass
                     pyautogui.hotkey('alt','s',_pause=False)
-                    warn(message=f"微信消息字数上限为2000,超过2000字部分将被省略,该条长文本消息已为你转换为txt发送",category=LongTextWarning) 
+                    warn(message=f"微信消息字数上限为2000,超过2000字部分将被省略,该条长文本消息已为你转换为txt发送",category=LongTextWarning)
         #发送文件逻辑
         def send_files(files):
             if len(files)<=9:
                 SystemSettings.copy_files_to_clipboard(filepaths_list=files)
                 pyautogui.hotkey("ctrl","v")
                 time.sleep(send_delay)
+                try:
+                    edit_area.set_focus()#Alt+S 前确保焦点在输入框
+                except Exception:
+                    pass
                 pyautogui.hotkey('alt','s',_pause=False)
             else:
                 files_num=len(files)
@@ -2019,11 +2031,19 @@ class Files():
                         SystemSettings.copy_files_to_clipboard(filepaths_list=files[i:i+9])
                         pyautogui.hotkey('ctrl','v')
                         time.sleep(send_delay)
+                        try:
+                            edit_area.set_focus()
+                        except Exception:
+                            pass
                         pyautogui.hotkey('alt','s',_pause=False)
                 if rem:
                     SystemSettings.copy_files_to_clipboard(filepaths_list=files[files_num-rem:files_num])
                     pyautogui.hotkey('ctrl','v')
                     time.sleep(send_delay)
+                    try:
+                        edit_area.set_focus()
+                    except Exception:
+                        pass
                     pyautogui.hotkey('alt','s',_pause=False)
         if is_maximize is None:
             is_maximize=GlobalConfig.is_maximize
@@ -3308,17 +3328,56 @@ class Messages():
             At_all(main_window)
         if at_members:
             At(main_window,at_members)
+        _MAX_SEND_RETRIES=2#最多重试2次,合计3次尝试
         for message in messages:
             if 0<len(message)<2000:
-                edit_area.click_input()
-                SystemSettings.copy_text_to_clipboard(message)#不要直接set_text,直接set_text相当于默认clear了
-                pyautogui.hotkey('ctrl','v',_pause=False)
-                time.sleep(send_delay)
-                pyautogui.hotkey('alt','s',_pause=False)
+                _sent_ok=False
+                for _attempt in range(1+_MAX_SEND_RETRIES):
+                    edit_area.click_input()
+                    SystemSettings.copy_text_to_clipboard(message)#不要直接set_text,直接set_text相当于默认clear了
+                    pyautogui.hotkey('ctrl','v',_pause=False)
+                    time.sleep(send_delay)
+                    #核心修复:Alt+S 前强制焦点回到输入框,避免焦点丢失导致发送无效
+                    try:
+                        edit_area.set_focus()
+                    except Exception:
+                        pass
+                    pyautogui.hotkey('alt','s',_pause=False)
+                    time.sleep(0.3)#等微信处理发送并清空输入框
+                    #校验:发送成功后输入框应清空。仅当明确读到仍是原文才判定失败重试,
+                    #读不到/为空/不一致一律保守视为成功,避免误重试导致重复发送
+                    try:
+                        _remaining=edit_area.window_text()
+                    except Exception:
+                        _remaining=None
+                    if _remaining is None:
+                        _sent_ok=True
+                        break
+                    _remaining=_remaining.strip() if isinstance(_remaining,str) else ''
+                    if not _remaining:
+                        _sent_ok=True
+                        break
+                    if _remaining==message.strip():
+                        if _attempt<_MAX_SEND_RETRIES:
+                            try:
+                                edit_area.set_text('')#清空残留,为重试做准备
+                            except Exception:
+                                pass
+                            continue
+                        raise RuntimeError(f"消息发送失败:{1+_MAX_SEND_RETRIES}次尝试后输入框内容仍未发出。前50字: {message[:50]}")
+                    _sent_ok=True
+                    break
+                if not _sent_ok:
+                    raise RuntimeError(f"消息发送失败:未知原因。前50字: {message[:50]}")
             elif len(message)>2000:#字数超过200字发送txt文件
                 SystemSettings.convert_long_text_to_txt(message)
                 pyautogui.hotkey('ctrl','v',_pause=False)
                 time.sleep(send_delay)
+                #长文本同样修焦点
+                try:
+                    edit_area.set_focus()
+                except Exception:
+                    pass
                 pyautogui.hotkey('alt','s',_pause=False)
                 warn(message=f"微信消息字数上限为2000,超过2000字部分将被省略,该条长文本消息已为你转换为txt发送",category=LongTextWarning)
         if close_weixin:

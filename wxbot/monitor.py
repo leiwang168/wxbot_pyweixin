@@ -62,6 +62,10 @@ def send_in_current_window(main_window, message: str) -> bool:
         SystemSettings.copy_text_to_clipboard(message)
         pyautogui.hotkey("ctrl", "v", _pause=False)
         time.sleep(0.5)
+        try:
+            edit_area.set_focus()  # Alt+S 前确保焦点在输入框,避免焦点丢失导致发送无效
+        except Exception:
+            pass
         pyautogui.hotkey("alt", "s", _pause=False)
         time.sleep(0.5)
         return True
