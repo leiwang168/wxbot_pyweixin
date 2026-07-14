@@ -60,8 +60,17 @@ class WxBotApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("wxbot 微信机器人")
-        self.root.geometry("600x1100")
-        self.root.minsize(600, 800)
+        self.root.update_idletasks()
+        # 启动定位到桌面右上角：尺寸先适配屏幕（固定 1100 高在 1080p 会超出，
+        # Windows 会强制重定位窗口导致右上角定位失效），再算右上角坐标
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        w = min(600, max(400, screen_w - 40))
+        h = min(1100, max(600, screen_h - 40))
+        self.root.minsize(w, min(h, 800))
+        x = max(0, screen_w - w - 20)
+        y = 20
+        self.root.geometry(f"{w}x{h}+{x}+{y}")
 
         self._running = False
         self._start_time: float | None = None
@@ -440,8 +449,27 @@ class WxBotApp:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    # DPI 感知：PyInstaller exe 默认不声明 DPI 感知，高 DPI 缩放下
+    # winfo_screenwidth 与 geometry 坐标系不一致，导致窗口定位偏移。必须在 root 创建前调用。
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)  # 1=系统级 DPI 感知
+    except Exception:
+        pass
+    # Splash 文字更新（仅打包环境存在 pyi_splash，开发模式 try/except 兜底）
+    try:
+        import pyi_splash
+        pyi_splash.update_text("正在初始化界面...")
+    except Exception:
+        pass
     root = tk.Tk()
     app = WxBotApp(root)
+    # 主窗口就绪，关闭 splash
+    try:
+        import pyi_splash
+        pyi_splash.close()
+    except Exception:
+        pass
 
     def _on_close():
         if app._running:

@@ -90,6 +90,7 @@ class MqttWorkerExtension:
         self._session_operate: dict[str, str] = {}  # {chat: operate} 会话级 operate 追踪
         self._last_sent: dict[str, tuple[str, float]] = {}  # {chat: (text, ts)} 防回环
         self._operate_lock = threading.Lock()
+        self._ui_tls = threading.local()  # 锁归属状态（epoch/acquired），线程局部
 
     # ---- operate 持久化（manual 接管重启不丢）----
     def set_session_operate(self, chat: str, val: str) -> None:
@@ -236,23 +237,55 @@ class MqttWorkerExtension:
         return self._coordinator._ui_lock if self._coordinator else None
 
     def _enter_ui(self) -> None:
-        """获取 UI 锁，标记进入 UI 操作（供异步媒体线程等使用）。"""
+        """获取 UI 锁，标记进入 UI 操作（供异步媒体线程等使用）。
+
+        记录 acquire 时的锁 epoch 到线程局部变量，_exit_ui 校验未变化才执行副作用。
+        """
+        self._ui_tls.acquired = False
+        self._ui_tls.lock = None
         if self._coordinator:
-            if not self._coordinator._ui_lock.acquire(timeout=30):
-                emit("WARNING", "UI 锁获取超时 (30s)，媒体保存跳过")
+            # 先快照锁引用再 acquire：确保记录的就是自己 acquire 的那把对象
+            lock = self._coordinator._ui_lock
+            if not lock.acquire(timeout=60):
+                emit("WARNING", "UI 锁获取超时 (60s)，媒体保存跳过")
                 raise RuntimeError("UI lock acquire timeout")
+            self._ui_tls.lock = lock
+            self._ui_tls.acquired = True
             self._coordinator._wx_busy_event.set()
             input_blocker.set_bot_active(True)  # 放行机器人点击
 
     def _exit_ui(self) -> None:
-        """释放 UI 锁，标记退出 UI 操作。"""
+        """释放 UI 锁，标记退出 UI 操作。
+
+        若我持有的锁已非当前活动锁（被重建过），跳过副作用避免污染新任务。
+        用锁对象身份比较，免疫 acquire/记录之间的重建竞态。
+        """
+        if not getattr(self._ui_tls, 'acquired', False):
+            return
+        held_lock = getattr(self._ui_tls, 'lock', None)
+        cur_lock = self._coordinator._ui_lock if self._coordinator else None
+        if held_lock is not None and held_lock is not cur_lock:
+            emit("WARNING",
+                 "_exit_ui: 我持有的锁已非当前活动锁（已被重建），"
+                 "跳过副作用避免污染新任务")
+            self._ui_tls.acquired = False
+            # 只释放自己 acquire 的那把（废弃的旧锁），绝不碰当前 coordinator._ui_lock（新锁）
+            try:
+                held_lock.release()
+            except RuntimeError:
+                pass
+            self._ui_tls.lock = None
+            return
         input_blocker.set_bot_active(False)
         if self._coordinator:
             self._coordinator._wx_busy_event.clear()
+        if held_lock is not None:
             try:
-                self._coordinator._ui_lock.release()
+                held_lock.release()
             except RuntimeError:
                 pass
+        self._ui_tls.lock = None
+        self._ui_tls.acquired = False
 
     def reconfigure(self) -> None:
         self._refresh_wx_account_info()
@@ -501,11 +534,6 @@ class MqttWorkerExtension:
                     emit("INFO", f"未匹配转发联系人，已发送 Webhook 提醒: {chat}")
                 except Exception as e:
                     emit("WARNING", f"Webhook 通知失败: {e}")
-        if forwarded and self._executor:
-            try:
-                self._executor.record_forwarded(chat)  # 记录转发 sender,供 send_text 串线兜底告警
-            except Exception:
-                pass
         return forwarded
 
     def on_friend_accepted(self, nickname: str, remark: str = "", tags: list | None = None) -> None:

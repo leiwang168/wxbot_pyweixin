@@ -35,6 +35,7 @@ from pyweixin.Uielements import Main_window, SideBar
 
 from ..config import bot_config
 from ..input_blocker import input_blocker
+from ..wx_dialog import dismiss_wx_dialog
 from .common import (MAX_CONTACT_LEN, MAX_HISTORY_LIMIT, MAX_MESSAGE_LEN,
                      MAX_TARGET_LEN, MAX_VERIFY_TEXT_LEN, emit)
 from .resolver import ContactResolver
@@ -56,56 +57,99 @@ class TaskExecutor:
         self._uploader = uploader  # MinioUploader 实例（get_friend_moments 截图上传用，可共享）
         self._wx_busy_event = wx_busy_event  # threading.Event, set during UI ops
         self._ui_lock: threading.Lock | None = None  # UI 互斥锁（由 coordinator 注入）
-        # 最近转发过的 sender(用于 send_text 串线兜底告警):(name, ts)
-        self._recent_forwarded: list[tuple[str, float]] = []
-        self._forwarded_lock = threading.Lock()
+        # 锁归属状态用 threading.local，避免共享 executor 的线程间并发覆盖
+        # _exit_ui 用锁对象身份比较（held is self._ui_lock）判断锁是否被重建，无需 epoch
+        self._ui_tls = threading.local()
 
     def _enter_ui(self) -> None:
         """获取 UI 锁 + 重置微信到聊天主页，确保后续操作从干净状态开始。
         若 monitor 正在处理消息（wx_busy），先等其完成再获取锁，避免打断消息检测→转发流程。"""
-        self._ui_lock_acquired = False
+        self._ui_tls.acquired = False
+        self._ui_tls.lock = None   # acquire 成功后记录实际获取的锁对象
         # 等待 monitor 完成当前消息处理周期（检测→转发MQTT）
         if self._wx_busy_event and self._wx_busy_event.is_set():
             self._log("INFO", "等待 monitor 完成当前消息处理...")
-            self._wx_busy_event.wait(timeout=60)  # 最多等60秒
-        if self._ui_lock:
-            if not self._ui_lock.acquire(timeout=30):
-                raise RuntimeError("UI 锁获取超时 (30s)，可能有残留任务占用")
-            self._ui_lock_acquired = True
-        # 强制回到聊天列表主页，消除上一个操作（如 add_friend）遗留的页面状态
+            self._wx_busy_event.wait(timeout=180)  # 最多等180秒（允许慢）
+        # 先快照锁引用再 acquire：确保记录的就是自己 acquire 的那把对象，
+        # 消除 acquire 与记录之间被重建替换的竞态
+        lock = self._ui_lock
+        if lock:
+            if not lock.acquire(timeout=60):
+                raise RuntimeError("UI 锁获取超时 (60s)，可能有残留任务占用")
+            self._ui_tls.acquired = True
+            self._ui_tls.lock = lock
+        # 强制回到聊天列表主页：先清上轮残留弹框（操作频繁等），再点 SideBar，
+        # 失败则清弹框重试——避免上个任务（如 add_friend）残留弹框/脏页面导致下个任务失败
+        mw = None
         try:
             mw = Navigator.open_weixin(is_maximize=False)
+            dismiss_wx_dialog(mw)
             mw.child_window(**SideBar.Weixin).click_input()
             time.sleep(0.15)
         except Exception as e:
-            self._log("WARNING", f"UI 窗口重置失败，后续操作可能受影响: {e}")
+            self._log("WARNING", f"_enter_ui 侧栏重置失败(疑似弹框): {e}")
+            try:
+                if mw is not None:
+                    dismiss_wx_dialog(mw)
+                    mw.child_window(**SideBar.Weixin).click_input()
+            except Exception as e2:
+                self._log("WARNING", f"_enter_ui 清弹框后仍失败，后续操作可能受影响: {e2}")
         if self._wx_busy_event:
             self._wx_busy_event.set()
         input_blocker.set_bot_active(True)  # 放行机器人点击
 
     def _exit_ui(self) -> None:
-        """释放 UI 锁，标记退出 UI 操作。若锁未获取（_enter_ui 超时），跳过 UI 操作避免干扰。"""
-        if not getattr(self, '_ui_lock_acquired', False):
-            # 锁未获取，不做任何 UI 操作，避免干扰持有锁的线程
+        """释放 UI 锁，标记退出 UI 操作。
+
+        若锁未获取（_enter_ui 超时）→ 跳过。
+        若我持有的锁已不是当前活动锁（被重建过）→ 跳过所有副作用
+        （UI 导航 / event clear / set_bot_active），避免污染正在用新锁的新任务。
+        用锁对象身份比较，天然免疫 acquire/记录之间的重建竞态。
+        """
+        if not getattr(self._ui_tls, 'acquired', False):
             return
-        # 先恢复微信到聊天主页（此时 bot_active 仍 True，放行点击）：上一个任务
-        # （add_friend 打开加好友面板/资料卡等)可能切走窗口，不恢复会让 monitor
-        # 下一轮读不到会话列表/聊天区，导致加好友期间到达的消息被漏掉
+        held_lock = getattr(self._ui_tls, 'lock', None)
+        # 身份比较：我持有的锁是否仍是当前活动锁。不同 → 已被重建，跳过副作用
+        if held_lock is not None and held_lock is not self._ui_lock:
+            self._log("WARNING",
+                      "_exit_ui: 我持有的锁已非当前活动锁（已被重建），"
+                      "跳过副作用避免污染新任务")
+            self._ui_tls.acquired = False
+            # 只释放自己 acquire 的那把（废弃的旧锁），绝不碰当前 self._ui_lock（新锁）
+            try:
+                held_lock.release()
+            except RuntimeError:
+                pass
+            self._ui_tls.lock = None
+            return
+        # 先恢复微信到聊天主页并清弹框（此时 bot_active 仍 True，放行点击）：上个任务
+        # （add_friend 打开加好友面板/资料卡等)可能切走窗口或留弹框，不恢复会让 monitor
+        # 下一轮读不到会话列表/聊天区，也会让下个任务在脏页面操作（如查无此人）
+        mw = None
         try:
             mw = Navigator.open_weixin(is_maximize=False)
+            dismiss_wx_dialog(mw)
             mw.child_window(**SideBar.Weixin).click_input()
             time.sleep(0.15)
         except Exception as e:
-            self._log("WARNING", f"_exit_ui 恢复聊天主页失败: {e}")
+            self._log("WARNING", f"_exit_ui 恢复聊天主页失败(疑似弹框): {e}")
+            try:
+                if mw is not None:
+                    dismiss_wx_dialog(mw)
+                    mw.child_window(**SideBar.Weixin).click_input()
+            except Exception as e2:
+                self._log("WARNING", f"_exit_ui 清弹框后仍失败: {e2}")
         input_blocker.set_bot_active(False)
         if self._wx_busy_event:
             self._wx_busy_event.clear()
-        if self._ui_lock:
+        # 释放自己 acquire 的那把锁（正常路径下 held_lock 即当前 self._ui_lock）
+        if held_lock is not None:
             try:
-                self._ui_lock.release()
+                held_lock.release()
             except RuntimeError:
                 pass
-        self._ui_lock_acquired = False
+        self._ui_tls.lock = None
+        self._ui_tls.acquired = False
 
     @staticmethod
     def _click_session(who: str) -> None:
@@ -192,27 +236,6 @@ class TaskExecutor:
         return v
 
     # ---- send_text ----
-    def record_forwarded(self, name: str) -> None:
-        """记录最近转发过的 sender(用于 send_text 串线兜底告警,30s 滑窗)。"""
-        if not name:
-            return
-        now = time.time()
-        with self._forwarded_lock:
-            self._recent_forwarded.append((name, now))
-            self._recent_forwarded = [(n, t) for n, t in self._recent_forwarded if t > now - 30]
-
-    def _target_in_recent_forwarded(self, name: str) -> bool:
-        if not name:
-            return False
-        now = time.time()
-        with self._forwarded_lock:
-            return any(n == name for n, t in self._recent_forwarded if t > now - 30)
-
-    def _recent_forwarded_names(self) -> list:
-        now = time.time()
-        with self._forwarded_lock:
-            return [n for n, t in self._recent_forwarded if t > now - 30]
-
     def _execute_send_text(self, task: dict) -> dict:
         target_raw = _field(task, "targetName") or _field(task, "targetId", "")
         message_raw = _field(task, "text", "")
@@ -242,11 +265,6 @@ class TaskExecutor:
         else:
             effective = resolved.display_name
             self._log("INFO", f"联系人解析: {target} → {effective} (matched_by={resolved.matched_by})")
-
-        # 兜底告警:targetName 与最近 30s 转发过的 sender 都不匹配 → 可能上游 agent 回错人(串线)
-        # 不阻断发送(跨人回复/转发是合法场景),仅 WARNING 辅助排查
-        if not self._target_in_recent_forwarded(effective) and not self._target_in_recent_forwarded(target):
-            self._log("WARNING", f"[串线告警] send_text 目标 {target!r}(→{effective!r}) 不在最近30s转发的sender里，可能回错人(最近转发: {self._recent_forwarded_names()})")
 
         results = []
         local_file = None
@@ -299,12 +317,23 @@ class TaskExecutor:
         try:
             self._enter_ui()
             try:
-                pre_delay = int(bot_config.get("friend_add", {}).get("pre_delay", 3) or 0)
+                pre_delay = int(bot_config.get("friend_add", {}).get("pre_delay", 0) or 0)
                 if pre_delay > 0:
                     self._log("INFO", f"加好友前等待 {pre_delay}s（拟人延迟）")
                     time.sleep(pre_delay)
-                nickname = FriendSettings.add_new_friend(number=target, greetings=verify_text or None,
-                                              remark=remark or None, chat_only=chat_only, close_weixin=False)
+                try:
+                    nickname = FriendSettings.add_new_friend(number=target, greetings=verify_text or None,
+                                                  remark=remark or None, chat_only=chat_only, close_weixin=False)
+                except Exception as e:
+                    # 与主循环一致(monitor.py:735-742)：异常疑似弹框所致，用 OpenCV 模板匹配
+                    # 点掉 confirm/unlock 等弹窗按钮，保证下个任务/下一轮 monitor 在干净页面。
+                    # 仅清弹窗不重试，最终仍返回失败。
+                    self._log("WARNING", f"添加好友异常(疑似弹框)，OpenCV 清理弹窗: {e}")
+                    try:
+                        dismiss_wx_dialog(Navigator.open_weixin(is_maximize=False))
+                    except Exception as de:
+                        self._log("WARNING", f"清理弹窗失败: {de}")
+                    raise
             finally:
                 self._exit_ui()
         except Exception as e:

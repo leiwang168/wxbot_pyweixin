@@ -28,6 +28,7 @@ from . import commands
 from .config import bot_config
 from .logger import log
 from .input_blocker import input_blocker
+from .wx_dialog import dismiss_wx_dialog
 from .mqtt.worker import mqtt_worker
 from .reply import reply_engine, is_listened_chat, match_forward, human_delay, split_long_text
 
@@ -60,7 +61,7 @@ def send_in_current_window(main_window, message: str) -> bool:
         edit_area.set_text("")
         SystemSettings.copy_text_to_clipboard(message)
         pyautogui.hotkey("ctrl", "v", _pause=False)
-        time.sleep(0.3)
+        time.sleep(0.5)
         pyautogui.hotkey("alt", "s", _pause=False)
         time.sleep(0.5)
         return True
@@ -598,6 +599,59 @@ def _group_monitor_forward(main_window, chat: str, sender: str, text: str,
 # ---------------------------------------------------------------------------
 # 主循环
 # ---------------------------------------------------------------------------
+def _activate_weixin_by_cv() -> bool:
+    """OpenCV 截屏匹配任务栏/托盘微信图标并点击激活（open_weixin 失败兜底）。
+
+    覆盖场景：微信窗口不在前台、被最小化到托盘、句柄丢失但进程还在——
+    点任务栏图标重新唤出窗口，再让 open_weixin 重试。
+    注意：对"无障碍树/UI 树不可见"(讲述人 trick 失效) 无效，那需重启无障碍服务。
+    模板缺失(config/images/weixin_icon.png)安全返回 False。
+    """
+    import cv2
+    import numpy as np
+    import os as _os
+    from PIL import ImageGrab
+    from .paths import get_images_dir
+    try:
+        tpl = cv2.imread(_os.path.join(get_images_dir(), 'weixin_icon.png'), cv2.IMREAD_COLOR)
+        if tpl is None:
+            return False
+        shot = cv2.cvtColor(np.array(ImageGrab.grab()), cv2.COLOR_RGB2BGR)
+        th, tw = tpl.shape[:2]
+        if shot.shape[0] < th or shot.shape[1] < tw:
+            return False
+        res = cv2.matchTemplate(shot, tpl, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(res)
+        if max_val >= 0.75:
+            cx, cy = max_loc[0] + tw // 2, max_loc[1] + th // 2
+            pyautogui.click(cx, cy)
+            time.sleep(1.0)
+            log.info(f"[微信] OpenCV 激活微信窗口 (置信度{max_val:.3f}) @ ({cx},{cy})")
+            return True
+    except Exception as e:
+        log.debug(f"[微信] OpenCV 激活失败: {e}")
+    return False
+
+
+def _open_weixin_safe(retries: int = 3, interval: float = 2.0):
+    """打开微信主界面，失败(NotFoundError 等瞬时异常)重试，全失败返回 None。
+
+    微信窗口被短暂遮挡/最小化/句柄丢失时 open_weixin 可能抛 NotFoundError
+    （"无法识别定位到微信主界面"）。重试间用 OpenCV 匹配任务栏图标点击激活，
+    覆盖窗口未激活场景；持续失败返回 None，由调用方跳过本轮，避免中断主循环。
+    """
+    for i in range(retries):
+        try:
+            return Navigator.open_weixin(is_maximize=False)
+        except Exception as e:
+            log.warning(f"[微信] 打开主界面失败({i + 1}/{retries}): {e}")
+            # OpenCV 激活兜底：尝试点任务栏图标唤出微信窗口（窗口未激活/在托盘时有效）
+            _activate_weixin_by_cv()
+            if i < retries - 1:
+                time.sleep(interval)
+    return None
+
+
 class _BoundedSet:
     """大小受限的去重集合，基于 OrderedDict 实现 LRU 淘汰。"""
     def __init__(self, maxsize: int = 5000) -> None:
@@ -619,7 +673,7 @@ class _BoundedSet:
 class Monitor:
     def __init__(self, check_interval: float = 10.0) -> None:
         self.check_interval = check_interval
-        self._run_timeout = 30.0
+        self._run_timeout = 120.0
         self._stop = threading.Event()
         self._last_loop_alert = ("", 0.0)  # (异常文本, 时间戳)，节流防刷屏
         self.processed: _BoundedSet = _BoundedSet(maxsize=5000)
@@ -637,18 +691,16 @@ class Monitor:
         ui_lock = mqtt_worker.ui_lock
         if ui_lock and not ui_lock.acquire(timeout=0.5):
             self._lock_fail_count += 1
-            # 连续失败超过阈值（约 2 分钟）→ 重建锁，恢复 monitor 轮询
-            if self._lock_fail_count >= 12:
-                log.warning(f"UI 锁连续 {self._lock_fail_count} 轮获取失败，重建锁恢复轮询")
+            # 连续失败超过阈值（约 5 分钟）→ 调 coordinator 统一入口重建锁恢复轮询
+            if self._lock_fail_count >= 30:
+                log.warning(f"UI 锁连续 {self._lock_fail_count} 轮获取失败，调用统一入口重建锁")
                 try:
-                    new_lock = threading.Lock()
                     coord = mqtt_worker._coordinator
-                    if coord:
-                        coord._ui_lock = new_lock
-                        if coord._executor:
-                            coord._executor._ui_lock = new_lock
-                        else:
-                            log.warning("重建UI锁时 executor 为 None，互斥可能短暂失效")
+                    if coord and hasattr(coord, '_rebuild_ui_lock'):
+                        coord._rebuild_ui_lock(
+                            f"monitor 连续 {self._lock_fail_count} 轮获取失败")
+                    else:
+                        log.warning("coordinator 不支持 _rebuild_ui_lock，无法重建")
                     self._lock_fail_count = 0
                 except Exception as e:
                     log.error(f"重建 UI 锁失败: {e}")
@@ -675,8 +727,19 @@ class Monitor:
                     pass
 
     def _run_once_locked(self) -> None:
-        main_window = Navigator.open_weixin(is_maximize=False)
-        main_window.child_window(**SideBar.Weixin).click_input()
+        main_window = _open_weixin_safe()
+        if main_window is None:
+            log.error("[监听] 无法打开微信主界面(无障碍服务/讲述人可能失效或微信异常)，跳过本轮")
+            return
+        dismiss_wx_dialog(main_window)  # 先清理可能的提示弹框（操作频繁等）
+        try:
+            main_window.child_window(**SideBar.Weixin).click_input()
+        except Exception as e:
+            log.warning(f"[监听] 点击微信侧栏失败(疑似弹框): {e}")
+            if dismiss_wx_dialog(main_window):
+                main_window.child_window(**SideBar.Weixin).click_input()  # 清弹框后重试
+            else:
+                raise
         time.sleep(0.3)
 
         # 首次启动默认切换到文件传输助手
@@ -700,6 +763,14 @@ class Monitor:
                 log.warning(f"切换到文件传输助手失败: {e}")
 
         # ① 轮询当前停留会话（不依赖未读红点）
+        # current_friend 理论上只由 ② 设置（已过滤白名单），但手动切换/历史状态可能残留
+        # 非白名单私聊会话 → 不读取其消息
+        if (self.current_friend is not None
+                and not _is_group(self.current_friend)
+                and not is_listened_chat(self.current_friend, False)):
+            log.info(f"[监听] 当前停留会话 {self.current_friend} 不在白名单，停止轮询")
+            self.current_friend = None
+            self.current_last_rid = None
         if self.current_friend is not None:
             chat_list = main_window.child_window(**Lists.FriendChatList)
             if chat_list.exists(timeout=0.5):
@@ -741,7 +812,23 @@ class Monitor:
             log.info(f"检测到 {new_num} 条新消息")
             new_msg_dict = scan_for_new_messages(main_window=main_window, is_maximize=False, close_weixin=False)
             for friend, num in new_msg_dict.items():
-                main_window.child_window(**SideBar.Weixin).click_input()
+                # 不在监听白名单的私聊好友：不点开阅读（避免读取非关注消息、节省 UI 操作）
+                # 群聊仍读取（群监控关键词匹配需要先拿到消息文本）
+                if not _is_group(friend) and not is_listened_chat(friend, False):
+                    log.info(f"[监听] {friend} 不在白名单，跳过阅读其新消息")
+                    continue
+                try:
+                    main_window.child_window(**SideBar.Weixin).click_input()
+                except Exception as e:
+                    log.warning(f"[监听] 点击微信侧栏失败(疑似弹框) {friend}: {e}")
+                    if dismiss_wx_dialog(main_window):
+                        try:
+                            main_window.child_window(**SideBar.Weixin).click_input()
+                        except Exception as e2:
+                            log.warning(f"[监听] 清弹框后仍失败，跳过 {friend}: {e2}")
+                            continue
+                    else:
+                        continue
                 time.sleep(0.5)
                 session_list = main_window.child_window(**Main_window.SessionList)
                 if not _find_and_click_session(session_list, friend):
@@ -753,11 +840,17 @@ class Monitor:
                     _process_one(main_window, friend, friend, msg_text, msg_type,
                                  self.current_friend, self.processed, file_path=file_path,
                                  msg_item=msg_item)
-                # 记录为当前停留会话
-                chat_list = main_window.child_window(**Lists.FriendChatList)
-                chat_items = chat_list.children(control_type="ListItem")
+                # 记录为当前停留会话：先无条件记录 current_friend（红点已点开该会话），
+                # current_last_rid 允许暂缺（消息列表可能因媒体预览/资料卡等暂不可见）
                 self.current_friend = friend
-                self.current_last_rid = chat_items[-1].element_info.runtime_id if chat_items else None
+                self.current_last_rid = None
+                chat_list = main_window.child_window(**Lists.FriendChatList)
+                if chat_list.exists(timeout=0.5):
+                    try:
+                        chat_items = chat_list.children(control_type="ListItem")
+                        self.current_last_rid = chat_items[-1].element_info.runtime_id if chat_items else None
+                    except Exception as e:
+                        log.warning(f"[监听] 读取 {friend} 消息列表基线失败，current_last_rid 置空: {e}")
 
         # ③ 待通过好友主动检测(不依赖红点,主动遍历会话列表;有 pending 才执行)
         self._check_pending_friends(main_window)
@@ -818,7 +911,7 @@ class Monitor:
     def loop(self) -> None:
         self._stop.clear()  # 重置停止标志，支持 stop() 后再次启动
         self.check_interval = float(bot_config.get("monitor_check_interval", 10) or 10)
-        self._run_timeout = float(bot_config.get("monitor_run_timeout", 30) or 30)
+        self._run_timeout = float(bot_config.get("monitor_run_timeout", 120) or 120)
         log.info(f"📨 消息主循环启动（轮询间隔 {self.check_interval}s，单轮超时 {self._run_timeout}s）")
         in_pause = False
         try:

@@ -50,6 +50,61 @@ python main.py
 
 首次运行自动生成 `config/config.json`，按需编辑后重启或发 `/重载配置`。
 
+## 图形界面 (GUI)
+
+`wxbot_gui.py` 提供 tkinter 配置界面（可视化编辑配置、启停服务、实时日志）：
+
+```powershell
+set PYTHONUTF8=1
+python wxbot_gui.py
+```
+
+## 打包成 exe
+
+打包为单文件 `wxbot.exe`（内置启动 Splash，覆盖 bootloader 解压 + import 的等待期）：
+
+```powershell
+# 1. 安装打包工具（PyInstaller 5.0+，当前验证 6.21.0）
+pip install opencv-python pyinstaller
+
+# 2. 按配置打包（onefile, 无控制台）
+pyinstaller wxbot_gui.spec
+
+# 3. 产物
+#    dist/wxbot.exe          ← 双击运行（首次启动数秒，期间显示 Splash）
+#    dist/wxbot.exe 同级需放 config/  目录（config.json 等运行时配置）
+```
+
+### 打包资源说明
+
+`wxbot_gui.spec` 已配置打包以下资源：
+
+| 资源 | 路径 | 用途 |
+|------|------|------|
+| 模板图 | `config/images/*.png` | OpenCV 模板匹配（转账收款、红包拆开、弹框清理等按钮定位） |
+| Splash | `config/images/splash.png` | 启动 Loading 画面（可自行替换，建议 480×300） |
+
+**必需的模板图**（缺失则对应功能静默降级，不报错）：
+
+- `shoukuan_btn.png` — 转账"收款"按钮
+- `hongbao_btn.png` — 红包"开"按钮
+- `confirm_btn.png` — 微信提示弹框"确定"按钮（操作频繁等）
+- `unlock_btn.png`（可选）— 解锁提示按钮
+
+### 打包后目录结构
+
+```
+发布目录/
+├── wxbot.exe            # 主程序
+└── config/              # 运行时配置（可编辑）
+    ├── config.json      # 主配置
+    ├── persona/         # 岗位人设
+    ├── knowledge.json   # FAQ
+    └── images/          # 模板图（如改动需同步）
+```
+
+> 注：`build/`、`dist/` 为打包产物（未纳入版本管理）；重新打包前可删除确保干净。
+
 ## 配置说明
 
 完整字段见 `wxbot/config.py` 的 `DEFAULTS`（50 项）。关键项：

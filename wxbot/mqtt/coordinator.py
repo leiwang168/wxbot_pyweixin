@@ -53,6 +53,8 @@ class MqttCoordinator:
         self._task_pool = ThreadPoolExecutor(max_workers=2)
         self._wx_busy_event = threading.Event()
         self._ui_lock = threading.Lock()  # UI 互斥锁，防止多线程同时操作微信 UI
+        self._ui_lock_epoch = 0  # 锁版本号，每次重建 +1，仅用于日志观测（归属判断用锁对象身份比较）
+        self._rebuild_lock = threading.Lock()  # 保护 _rebuild_ui_lock，避免 coordinator/monitor 并发重建
         self._executor._wx_busy_event = self._wx_busy_event
         self._executor._ui_lock = self._ui_lock
 
@@ -67,6 +69,37 @@ class MqttCoordinator:
     @property
     def wx_busy(self) -> bool:
         return self._wx_busy_event.is_set()
+
+    def _rebuild_ui_lock(self, reason: str) -> None:
+        """统一 UI 锁重建入口：换新 Lock + 新 Event + epoch+1（epoch 仅日志用）。
+
+        卡死的旧线程无法强杀，其 _exit_ui 恢复后通过锁对象身份比较发现自己持的锁
+        已非当前活动锁，会跳过所有副作用（UI 导航 / event clear / set_bot_active），
+        避免污染新任务，且只释放自己持有的旧锁（绝不误释放新锁）。
+        新 Event 确保旧线程 clear 旧 event 不影响新任务。重建后重建线程池，丢弃旧池。
+        并发保护：coordinator（任务超时）与 monitor（连续失败）可能同时调用，用
+        _rebuild_lock 串行化，避免 epoch 双增 + 线程池泄漏。
+        """
+        with self._rebuild_lock:
+            self._ui_lock = threading.Lock()
+            self._wx_busy_event = threading.Event()
+            self._ui_lock_epoch += 1
+            self._executor._wx_busy_event = self._wx_busy_event
+            self._executor._ui_lock = self._ui_lock
+            try:
+                self._task_pool.shutdown(wait=False)
+            except Exception:
+                pass
+            self._task_pool = ThreadPoolExecutor(max_workers=2)
+            emit("WARNING", f"UI 锁已重建(epoch={self._ui_lock_epoch}): {reason}")
+        # 卡死线程的 finally 里 win32 关窗会失效，健康线程主动用 win32 强关残留朋友圈窗口
+        try:
+            from ..moments_export import _force_close_sns_window
+            _n = _force_close_sns_window()
+            if _n > 0:
+                emit("INFO", f"锁重建后 win32 关闭 {_n} 个朋友圈窗口")
+        except Exception as _e:
+            emit("WARNING", f"锁重建后 win32 关窗失败: {_e}")
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -266,25 +299,8 @@ class MqttCoordinator:
             except FuturesTimeout:
                 result = {"correlationId": cid, "status": "error",
                           "result": {"error": f"任务超时 ({self._task_timeout}s)"}}
-                emit("WARNING", "任务超时，重建线程池 + UI 锁")
-                # 重建 UI 锁：旧线程可能仍持有，换新锁让后续任务恢复正常
-                self._ui_lock = threading.Lock()
-                self._executor._ui_lock = self._ui_lock
-                try:
-                    self._task_pool.shutdown(wait=False)
-                except Exception:
-                    pass
-                self._task_pool = ThreadPoolExecutor(max_workers=2)
-                # 卡死的任务线程（如 dump 朋友圈遍历 COM 卡死）无法强杀，其 finally 里的
-                # win32 关窗在废弃线程里会失效（EnumWindows 枚举不到窗口）；
-                # 在此健康线程主动用 win32 强关残留的朋友圈窗口
-                try:
-                    from ..moments_export import _force_close_sns_window
-                    _n = _force_close_sns_window()
-                    if _n > 0:
-                        emit("INFO", f"任务超时后 win32 关闭 {_n} 个朋友圈窗口")
-                except Exception as _e:
-                    emit("WARNING", f"超时后 win32 关窗失败: {_e}")
+                emit("WARNING", f"任务超时({self._task_timeout}s)，重建 UI 锁 + 线程池")
+                self._rebuild_ui_lock(f"任务超时 cid={cid}")
             except Exception as e:
                 result = {"correlationId": cid, "status": "error",
                           "result": {"error": f"任务执行异常: {e}"}}

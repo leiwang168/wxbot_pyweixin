@@ -1,2 +1,1 @@
-set PYTHONUTF8=1
-python main.py
+python wxbot_gui.py
