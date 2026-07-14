@@ -457,6 +457,12 @@ def _process_one(main_window, chat: str, sender: str, text: str,
     if msg_type in ("被拉黑", "被删除"):
         log.warning(f"⚠️ {chat} 可能{msg_type}: {text!r}")
         processed.add(f"{chat}:{msg_type}:{text}")
+        kind = "blocked" if msg_type == "被拉黑" else "deleted"
+        try:
+            mqtt_worker.notify_contact_unreachable(
+                chat=chat, kind=kind, message=text, source="monitor")
+        except Exception as e:
+            log.warning(f"[contact-unreachable] Feishu/MQTT alert failed: {e}")
         return
 
     is_group = _is_group(chat)

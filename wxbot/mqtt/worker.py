@@ -89,6 +89,10 @@ class MqttWorkerExtension:
         self._wx_wechat_id = ""
         self._session_operate: dict[str, str] = {}  # {chat: operate} 会话级 operate 追踪
         self._last_sent: dict[str, tuple[str, float]] = {}  # {chat: (text, ts)} 防回环
+        # Deduplicate send_text active detection and monitor fallback for the same WeChat system receipt.
+        self._contact_unreachable_alerts: dict[tuple[str, str], float] = {}
+        self._contact_unreachable_alert_ttl = 60.0
+        self._alert_lock = threading.Lock()
         self._operate_lock = threading.Lock()
         self._ui_tls = threading.local()  # 锁归属状态（epoch/acquired），线程局部
 
@@ -535,6 +539,100 @@ class MqttWorkerExtension:
                 except Exception as e:
                     emit("WARNING", f"Webhook 通知失败: {e}")
         return forwarded
+
+    def _mark_contact_unreachable_alert(self, chat: str, kind: str) -> bool:
+        """Return True when an unreachable-contact alert should be emitted."""
+        now = time.time()
+        key = (chat, kind)
+        with self._alert_lock:
+            expired = [k for k, ts in self._contact_unreachable_alerts.items()
+                       if now - ts > self._contact_unreachable_alert_ttl]
+            for k in expired:
+                self._contact_unreachable_alerts.pop(k, None)
+            last = self._contact_unreachable_alerts.get(key)
+            if last and now - last <= self._contact_unreachable_alert_ttl:
+                return False
+            self._contact_unreachable_alerts[key] = now
+            return True
+
+    def notify_contact_unreachable(self, chat: str, kind: str, message: str = "",
+                                   source: str = "", correlation_id: str = "") -> bool:
+        """Unified alert for deleted/blocked friends: Feishu + MQTT system event."""
+        chat = (chat or "").strip() or "未知目标"
+        kind = (kind or "").strip()
+        if kind not in ("deleted", "blocked"):
+            emit("WARNING", f"unknown contact unreachable kind: chat={chat} kind={kind}")
+            return False
+        if not self._mark_contact_unreachable_alert(chat, kind):
+            emit("INFO", f"skip duplicate contact unreachable alert: {chat} kind={kind} source={source}")
+            return False
+
+        label = "被删除" if kind == "deleted" else "被拉黑"
+        nickname = self._wx_nickname or "未知"
+        try:
+            from .. import webhook_send
+            webhook_send.send_webhook(
+                title=f"【{label}】{nickname} → {chat}",
+                content=(f"目标: {chat}\n类型: {label}\n来源: {source or 'unknown'}\n"
+                         f"消息: {(message or '')[:200]}\n"
+                         f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            )
+        except Exception as e:
+            emit("WARNING", f"contact unreachable Feishu alert failed: {e}")
+
+        return self.on_contact_unreachable(
+            chat=chat, kind=kind, message=message,
+            source=source, correlation_id=correlation_id)
+
+    def on_contact_unreachable(self, chat: str, kind: str, message: str = "",
+                               source: str = "", correlation_id: str = "") -> bool:
+        """Publish MQTT system event for a deleted/blocked friend."""
+        if not self._initialized or not self._adapter:
+            return False
+        if not self._wx_nickname:
+            try:
+                emit("INFO", "refresh wx account info for contact unreachable alert")
+                self._refresh_wx_account_info()
+            except Exception as e:
+                emit("WARNING", f"refresh wx account info failed for contact unreachable alert: {e}")
+
+        label = "被删除" if kind == "deleted" else "被拉黑"
+        msg_id = correlation_id or f"unreachable-{uuid.uuid4().hex[:8]}"
+        event_text = f"[系统] 好友{label}，消息无法送达"
+        published = False
+        for ident in self._identities:
+            if not ident.enabled:
+                continue
+            forward_topic = ident.resolve_forward_topic()
+            if not forward_topic:
+                continue
+            callback_prefix = ident.resolve_callback_prefix()
+            publish_topic = f"{forward_topic}/{msg_id}" if callback_prefix and forward_topic == callback_prefix else forward_topic
+            payload = {
+                "event": "wechat_contact_unreachable",
+                "correlationId": msg_id,
+                "senderId": chat,
+                "senderName": chat,
+                "chatId": chat,
+                "targetId": chat,
+                "targetName": chat,
+                "text": event_text,
+                "chat": chat,
+                "type": kind,
+                "wechatErrorType": kind,
+                "source": source or "unknown",
+                "messagePreview": (message or "")[:200],
+                "agentId": ident.agent_id,
+                "role": ident.role,
+                "selfWxName": self._wx_nickname,
+                "selfWxId": self._wx_id,
+                "ts": int(time.time() * 1000),
+            }
+            payload_str = json.dumps(payload, ensure_ascii=False)
+            ok = self._adapter.publish_safe(publish_topic, payload_str)
+            emit("INFO", f"contact unreachable notice -> {publish_topic} role={ident.role} {'ok' if ok else 'failed'} payload={payload_str}", ident.role)
+            published = ok or published
+        return published
 
     def on_friend_accepted(self, nickname: str, remark: str = "", tags: list | None = None) -> None:
         if not self._initialized or not self._adapter:

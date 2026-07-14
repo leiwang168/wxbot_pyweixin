@@ -288,6 +288,20 @@ class TaskExecutor:
                 except Exception as e:
                     send_error = str(e)
                     self._log("ERROR", f"微信发送消息失败: {e}")
+            #发送成功后检测被删/被拉黑(持锁、会话窗口未重置,聊天流可读)
+            block_status = None
+            if (message or local_file) and not send_error:
+                try:
+                    from pyweixin.utils import detect_block_or_delete
+                    mw = Navigator.open_weixin(is_maximize=False)
+                    block_status = detect_block_or_delete(mw)
+                    if block_status:
+                        label = "被删除" if block_status == "deleted" else "被拉黑"
+                        self._log("WARNING", f"检测到对方{label}: {effective}")
+                except Exception as de:
+                    self._log("WARNING", f"被删/被拉黑检测失败: {de}")
+            if block_status in ("deleted", "blocked"):
+                self._notify_block_status(block_status, effective, message, _field(task, "correlationId", ""))
             if not results and send_error is None:
                 return {"status": "error", "error": "既无 message 也无 fileUrl"}
             self._click_session(effective)
@@ -299,11 +313,41 @@ class TaskExecutor:
                     os.remove(local_file)
                 except OSError:
                     pass
+        if block_status in ("deleted", "blocked"):
+            label = "被删除(朋友验证)" if block_status == "deleted" else "被拉黑(消息被拒收)"
+            return {"status": "success", "wechatResult": False,
+                    "wechatErrorType": block_status,
+                    "error": f"对方{label}: {effective}",
+                    "wechatRaw": "; ".join(results) if results else ""}
         if send_error:
             return {"status": "success", "wechatResult": False,
                     "error": f"微信发送失败: {send_error}",
                     "wechatRaw": "; ".join(results) if results else ""}
         return {"status": "success", "wechatResult": True, "wechatRaw": "; ".join(results)}
+
+    def _notify_block_status(self, kind: str, target: str, message: str,
+                             correlation_id: str = "") -> None:
+        """Notify Feishu and MQTT when a friend deleted/blocked the bot."""
+        try:
+            from .worker import mqtt_worker  # Lazy import avoids module initialization cycle.
+            mqtt_worker.notify_contact_unreachable(
+                chat=target, kind=kind, message=message,
+                source="send_text", correlation_id=correlation_id)
+            return
+        except Exception as e:
+            self._log("WARNING", f"contact unreachable unified alert failed, Feishu-only fallback: {e}")
+
+        # Keep the original Feishu alert as a last-resort fallback if worker facade is unavailable.
+        label = "被删除" if kind == "deleted" else "被拉黑"
+        try:
+            from .. import webhook_send
+            webhook_send.send_webhook(
+                title=f"【{label}】未知 → {target}",
+                content=(f"目标: {target}\n类型: {label}\n来源: send_text\n"
+                         f"消息: {message[:200]}\n时间: {time.strftime('%Y-%m-%d %H:%M:%S')}"),
+            )
+        except Exception as we:
+            self._log("WARNING", f"Feishu alert failed: {we}")
 
     # ---- add_friend ----
     def _execute_add_friend(self, task: dict) -> dict:
