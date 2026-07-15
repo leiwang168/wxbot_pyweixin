@@ -114,6 +114,42 @@ class ContactResolver:
                 self._resolve_retried = False
         return ResolveResult(success=False, error=f"未找到匹配联系人: {key}")
 
+    def find_wxid_by_remark(self, remark: str) -> ResolveResult:
+        """通过好友备注名查找微信号。
+
+        匹配顺序：精确备注 > 备注子串。备注子串有多个候选时，
+        返回第一个满足条件的（按缓存顺序，稳定可预期）。
+        找不到返回 success=False。
+        """
+        if not remark or not remark.strip():
+            return ResolveResult(success=False, error="remark 为空")
+        key = remark.strip()
+        with self._lock:
+            friends = list(self._friends)
+        lk = key.lower()
+        # 1) 精确备注
+        for f in friends:
+            if self._get_remark(f).lower() == lk:
+                return ResolveResult(success=True, display_name=self._display(f),
+                                     matched_by="remark", wxid=self._get_wxid(f))
+        # 2) 备注子串：多候选取第一个满足条件的
+        for f in friends:
+            r = self._get_remark(f).lower()
+            if r and lk in r:
+                return ResolveResult(success=True, display_name=self._display(f),
+                                     matched_by="remark-substring", wxid=self._get_wxid(f))
+        # 3) 缓存可能为空或陈旧，重载一次本地文件再找（与其他 resolver 实例追加的条目对齐）
+        if not getattr(self, '_remark_retried', False):
+            self._remark_retried = True
+            try:
+                self._load_from_file()
+                retried = self.find_wxid_by_remark(remark)
+                if retried.success:
+                    return retried
+            finally:
+                self._remark_retried = False
+        return ResolveResult(success=False, error=f"未找到备注匹配的联系人: {key}")
+
     def refresh_cache(self, timeout: int = 120) -> dict:
         # 限速：防止频繁全量拉取（UI 操作），两次刷新间隔至少 _REFRESH_COOLDOWN 秒
         now = time.time()

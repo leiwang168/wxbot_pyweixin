@@ -1550,14 +1550,15 @@ class FriendSettings():
         search_edit.set_text('')
         search_edit.type_keys(number,with_spaces=True)
         search_edit.type_keys('{ENTER}')
+        time.sleep(1.0)#等待搜索结果加载,避免UI未就绪误判"搜不到"
         contact_profile_view=add_friend_pane.child_window(**Groups.ContactProfileViewGroup)
-        if not contact_profile_view.exists(timeout=2):
+        if not contact_profile_view.exists(timeout=4):
             #搜不到该号码对应的用户(号码不存在或输错),不会发出申请
             add_friend_pane.close()
             if close_weixin:main_window.close()
             raise NoSuchFriendError(f'未搜索到 {number} 对应的用户,请检查号码是否正确')
         add_to_contact=contact_profile_view.child_window(**Buttons.AddToContactsButton)
-        if not add_to_contact.exists(timeout=2):
+        if not add_to_contact.exists(timeout=4):
             #资料页存在但无"添加到通讯录"按钮,通常是对方已是好友
             add_friend_pane.close()
             if close_weixin:main_window.close()
@@ -1566,6 +1567,7 @@ class FriendSettings():
         texts=contact_profile_view.descendants(control_type='Text')
         nickname=texts[0].window_text() if texts else number
         add_to_contact.click_input()
+        time.sleep(0.8)#等待点击"添加到通讯录"后验证朋友弹窗弹出并稳定
         verify_friend_window=Tools.move_window_to_center(Window=Windows.VerifyFriendWindow)
         request_content_edit=verify_friend_window.child_window(control_type='Edit',found_index=0)
         remark_edit=verify_friend_window.child_window(control_type='Edit',found_index=1)
@@ -1577,7 +1579,9 @@ class FriendSettings():
             remark_edit.set_text(remark)
         if chat_only:
             chat_only_group.click_input()
+        time.sleep(0.3)#填写完毕后短暂稳定再点确认,避免按钮未就绪
         confirm_button.click_input()
+        time.sleep(0.6)#等待好友申请发出,过早关闭可能导致请求丢失
         add_friend_pane.close()
         if close_weixin:
             main_window.close()
@@ -2517,21 +2521,28 @@ class Moments():
             if not paths:raise ValueError(f'medias列表内无可用图片或视频路径!')
         moments=Navigator.open_moments(is_maximize=is_maximize,close_weixin=close_weixin)
         moments.child_window(**Buttons.PostButton).right_click_input(),
+        time.sleep(0.6)#等待右键菜单弹出
         pyautogui.press('up',presses=2)
+        time.sleep(0.3)#让菜单选项高亮稳定
         if medias:
             pyautogui.press('enter')
+            time.sleep(0.5)#等待原生文件选择窗口弹出
             native_window=desktop.window(**Windows.NativeChooseFileWindow)
             edit=native_window.child_window(**Edits.NativeFileSaveEdit)
             edit.set_text(paths)
+            time.sleep(0.3)#路径填入后短暂稳定再确认
             pyautogui.hotkey('alt','o')
+            time.sleep(0.8)#等待回到发布面板且媒体缩略图加载
         if text and not medias:
             pyautogui.press('down',presses=1)
             pyautogui.press('enter')
+            time.sleep(0.5)#等待纯文字发布面板弹出
         publish_panel=moments.child_window(**Groups.SnsPublishGroup)
         if text:
             text_input=publish_panel.child_window(**Edits.SnsEdit)
             text_input.click_input()
             text_input.set_text(text)
+            time.sleep(0.4)#文本填入后短暂稳定再发布
         post_button=publish_panel.child_window(**Buttons.PostButton)
         post_button.click_input()
         # 等微信服务器处理 + 弹出"已发送"提示消失后再关闭

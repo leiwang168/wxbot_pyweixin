@@ -359,6 +359,18 @@ class WxBotApp:
             self._monitor = _monitor
             self._mqtt_worker = mqtt_worker
 
+            # 人工操作屏蔽（与 main.py 一致：勾选则装低级鼠标钩子并启用）
+            _ib = bot_config.get("input_block", {}) or {}
+            if _ib.get("enabled"):
+                try:
+                    from wxbot.input_blocker import input_blocker
+                    input_blocker.configure(auto_release_minutes=_ib.get("auto_release_minutes", 30))
+                    input_blocker.start()
+                    input_blocker.enable(reason="GUI 启动")
+                    log.info("🛡 人工操作屏蔽已启用（Ctrl+Alt+X 或 /解除屏蔽 解除）")
+                except Exception as e:
+                    log.warning(f"人工操作屏蔽启动失败: {e}")
+
             def _run():
                 try:
                     _monitor.loop()
@@ -382,6 +394,14 @@ class WxBotApp:
         try:
             if self._monitor:
                 self._monitor.stop()
+            # 停止人工操作屏蔽（解除并卸载钩子）
+            try:
+                from wxbot.input_blocker import input_blocker
+                if input_blocker._started:
+                    input_blocker.disable(reason="GUI 停止")
+                    input_blocker.stop()
+            except Exception as e:
+                log.warning(f"人工操作屏蔽停止失败: {e}")
             self._running = False
             self._start_time = None
             self._btn_start.config(state=tk.NORMAL)

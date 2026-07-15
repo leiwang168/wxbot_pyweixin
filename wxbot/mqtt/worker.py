@@ -111,6 +111,18 @@ class MqttWorkerExtension:
         except Exception as e:
             emit("WARNING", f"写入 operate 缓存失败: {e}")
 
+    # ---- 防回环指纹（跨线程读写：MQTT 协调器写、上行转发读，用 _operate_lock 保护）----
+    def record_last_sent(self, chat: str, text: str) -> None:
+        """记录最近向 chat 发送的消息指纹，供上行转发防回环。线程安全。"""
+        with self._operate_lock:
+            self._last_sent[chat] = (text, time.time())
+
+    def is_recent_sent(self, chat: str, text: str, ttl: float = 30.0) -> bool:
+        """是否为 ttl 秒内由 bot 发出的同文本消息（回环判定）。线程安全。"""
+        with self._operate_lock:
+            last = self._last_sent.get(chat)
+        return bool(last and last[0] == text and time.time() - last[1] < ttl)
+
     def _load_operate_cache(self) -> dict:
         if not os.path.exists(_OPERATE_CACHE_PATH):
             return {}
@@ -480,8 +492,7 @@ class MqttWorkerExtension:
             return False
 
         # 防回环
-        last = self._last_sent.get(chat)
-        if last and last[0] == content and time.time() - last[1] < 30:
+        if self.is_recent_sent(chat, content):
             emit("INFO", f"跳过回环消息(刚由 bot 发出): {chat} -> {content[:50]}")
             return False
 

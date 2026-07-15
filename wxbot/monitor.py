@@ -926,17 +926,28 @@ class Monitor:
         in_pause = False
         try:
             while not self._stop.is_set():
-                if self._in_pause_period():
-                    if not in_pause:
-                        in_pause = True
-                        log.info(f"📨 进入消息监听暂停时段"
-                                 f"(停止 {bot_config.get('everyday_stop_bot_time')} ~ 恢复 {bot_config.get('everyday_start_bot_time')})，停止轮询")
-                    self._stop.wait(self.check_interval)
-                    continue
-                if in_pause:
-                    in_pause = False
-                    log.info("📨 暂停时段结束，恢复消息监听")
-                self._run_once_guarded()
+                try:
+                    if self._in_pause_period():
+                        if not in_pause:
+                            in_pause = True
+                            log.info(f"📨 进入消息监听暂停时段"
+                                     f"(停止 {bot_config.get('everyday_stop_bot_time')} ~ 恢复 {bot_config.get('everyday_start_bot_time')})，停止轮询")
+                        self._stop.wait(self.check_interval)
+                        continue
+                    if in_pause:
+                        in_pause = False
+                        log.info("📨 暂停时段结束，恢复消息监听")
+                    self._run_once_guarded()
+                except KeyboardInterrupt:
+                    raise
+                except Exception as e:
+                    # 单轮任意异常都不应中断主循环：_run_once_guarded 已兜底 run_once，
+                    # 此处防御 _in_pause_period / _stop.wait 等意外异常，记日志+飞书后继续轮询
+                    log.error(f"主循环单轮意外异常（已兜底，继续轮询）: {e}")
+                    try:
+                        self._alert_loop_exception(e)
+                    except Exception:
+                        pass
                 self._stop.wait(self.check_interval)
         except KeyboardInterrupt:
             self._stop.set()

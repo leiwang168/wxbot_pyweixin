@@ -292,6 +292,7 @@ class MqttCoordinator:
         cid = task.get("correlationId", "")
         emit("INFO", f"处理任务 event={task.get('event')} cid={cid} role={identity.role} task={payload}", identity.role)
         # wx_busy 由 executor 内部在 UI 操作期间自行管理，不在整个任务执行期持有
+        result = None
         try:
             future = self._task_pool.submit(self._executor.execute_task, task)
             try:
@@ -304,9 +305,16 @@ class MqttCoordinator:
             except Exception as e:
                 result = {"correlationId": cid, "status": "error",
                           "result": {"error": f"任务执行异常: {e}"}}
+        except Exception as e:
+            # submit 本身失败（如线程池已 shutdown）：返回错误结果并回调，而非冒泡触发不必要的 MQTT 重连
+            result = {"correlationId": cid, "status": "error",
+                      "result": {"error": f"任务提交失败: {e}"}}
+            emit("ERROR", f"任务提交异常 cid={cid}: {e}", identity.role)
         finally:
             # wx_busy 由 executor _enter_ui/_exit_ui 内部管理，不在此清除
-            pass
+            if result is None:
+                result = {"correlationId": cid, "status": "error",
+                          "result": {"error": "未知执行失败"}}
 
         with self._lock:
             self._task_count += 1
@@ -366,7 +374,7 @@ class MqttCoordinator:
                 if target_name:
                     sent_text = task.get("text", "")
                     if sent_text:
-                        self._extension._last_sent[target_name] = (sent_text, time.time())
+                        self._extension.record_last_sent(target_name, sent_text)
                         emit("INFO", f"已记录发送指纹: {target_name} -> {sent_text[:40]}", identity.role)
 
     def get_status(self) -> dict:
