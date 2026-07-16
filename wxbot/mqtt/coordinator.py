@@ -201,6 +201,9 @@ class MqttCoordinator:
             return
         if identity.is_self_target(adapted):
             return
+        if identity.is_duplicate(adapted):
+            emit("INFO", f"忽略重复任务(同 correlationId) topic={topic} role={identity.role}", identity.role)
+            return
         emit("INFO", f"收到任务 topic={topic} role={identity.role} payload={adapted}", identity.role)
         event_type = ""
         try:

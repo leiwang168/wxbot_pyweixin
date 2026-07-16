@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -22,7 +23,7 @@ from pyweixin.Uielements import Windows
 from ..config import bot_config
 from ..input_blocker import input_blocker
 from .adapter import MqttAdapter
-from .common import MinioUploader, emit
+from .common import DEDUP_WINDOW, MinioUploader, emit
 from .coordinator import MqttCoordinator
 from .executor import TaskExecutor
 from .identity import WorkerIdentity
@@ -32,6 +33,66 @@ from ..paths import get_config_dir
 
 _CONFIG_PATH = os.path.join(get_config_dir(), "config.json")
 _OPERATE_CACHE_PATH = os.path.join(get_config_dir(), "operate_cache.json")
+
+
+
+class _MqttProcessLock:
+    """Best-effort inter-process lock for one MQTT subscription set."""
+
+    def __init__(self, path: str, label: str) -> None:
+        self.path = path
+        self.label = label
+        self._fh = None
+
+    def acquire(self) -> bool:
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        self._fh = open(self.path, "a+", encoding="utf-8")
+        try:
+            self._fh.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self._close()
+            return False
+        self._fh.seek(0)
+        self._fh.truncate()
+        self._fh.write(json.dumps({
+            "pid": os.getpid(),
+            "label": self.label,
+            "startedAt": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }, ensure_ascii=False))
+        self._fh.flush()
+        try:
+            os.fsync(self._fh.fileno())
+        except OSError:
+            pass
+        return True
+
+    def release(self) -> None:
+        if not self._fh:
+            return
+        try:
+            self._fh.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        self._close()
+
+    def _close(self) -> None:
+        try:
+            if self._fh:
+                self._fh.close()
+        finally:
+            self._fh = None
 
 
 def _patch_open_friend_profile():
@@ -95,6 +156,7 @@ class MqttWorkerExtension:
         self._alert_lock = threading.Lock()
         self._operate_lock = threading.Lock()
         self._ui_tls = threading.local()  # 锁归属状态（epoch/acquired），线程局部
+        self._process_lock: _MqttProcessLock | None = None
 
     # ---- operate 持久化（manual 接管重启不丢）----
     def set_session_operate(self, chat: str, val: str) -> None:
@@ -182,8 +244,44 @@ class MqttWorkerExtension:
             self._resolver = ContactResolver(log_func=emit)
         return self._resolver
 
+    @staticmethod
+    def _process_lock_label(workers_cfg: list) -> str:
+        topics: list[str] = []
+        for worker in workers_cfg:
+            if not worker.get("enabled", True):
+                continue
+            role = (worker.get("role") or "").strip()
+            topic = ((worker.get("topics", {}) or {}).get("subscribe") or "").strip()
+            if topic and "{role}" in topic:
+                topic = topic.replace("{role}", role)
+            if topic:
+                topics.append(topic)
+        return "|".join(sorted(set(topics))) or "mqtt-worker"
+
+    def _acquire_process_lock(self, workers_cfg: list) -> bool:
+        label = self._process_lock_label(workers_cfg)
+        digest = hashlib.sha256(label.encode("utf-8")).hexdigest()[:16]
+        lock_path = os.path.join(get_config_dir(), f"mqtt_worker_{digest}.lock")
+        lock = _MqttProcessLock(lock_path, label)
+        if not lock.acquire():
+            emit("ERROR", f"MQTT worker start blocked: subscription set already owned [{label}] (lock={lock_path}, pid={os.getpid()})")
+            return False
+        self._process_lock = lock
+        emit("INFO", f"MQTT process lock acquired: [{label}] lock={lock_path} pid={os.getpid()}")
+        return True
+
+    def _release_process_lock(self) -> None:
+        if self._process_lock:
+            label = self._process_lock.label
+            self._process_lock.release()
+            self._process_lock = None
+            emit("INFO", f"MQTT process lock released: [{label}] pid={os.getpid()}")
+
     # ---- 生命周期 ----
     def initialize(self) -> None:
+        if self._coordinator:
+            emit("WARNING", f"MQTT worker already initialized; skip duplicate initialize pid={os.getpid()}")
+            return
         # 恢复 operate 持久化状态（manual 接管等），重启后继续生效
         loaded = self._load_operate_cache()
         if loaded:
@@ -209,9 +307,15 @@ class MqttWorkerExtension:
             self._initialized = True
             return
 
+        self._release_process_lock()
+        if not self._acquire_process_lock(workers_cfg):
+            self._initialized = True
+            return
+
         self._identities = [WorkerIdentity(w) for w in workers_cfg]
         emit("INFO", f"初始化 MQTT 数字员工 共 {len(self._identities)} 个身份，"
               f"启用 {sum(1 for i in self._identities if i.enabled)} 个")
+        emit("INFO", f"correlationId 去重窗口={DEDUP_WINDOW}s（同 id 在窗口内忽略，过期后可重新处理）")
         self._validate_multi_identity()
 
         first = next((i for i in self._identities if i.enabled),
@@ -303,6 +407,16 @@ class MqttWorkerExtension:
         self._ui_tls.lock = None
         self._ui_tls.acquired = False
 
+    def shutdown(self) -> None:
+        if self._coordinator:
+            self._coordinator.shutdown()
+            self._release_process_lock()
+        self._coordinator = None
+        self._adapter = None
+        self._executor = None
+        self._identities = []
+        self._release_process_lock()
+
     def reconfigure(self) -> None:
         self._refresh_wx_account_info()
         cfg = bot_config.get("mqtt_worker", {}) or {}
@@ -310,6 +424,8 @@ class MqttWorkerExtension:
         if not cfg.get("enabled"):
             if self._coordinator:
                 self._coordinator.shutdown()
+                self._release_process_lock()
+            self._release_process_lock()
             self._coordinator = None
             self._adapter = None
             self._executor = None
@@ -321,6 +437,8 @@ class MqttWorkerExtension:
         if not workers_cfg:
             if self._coordinator:
                 self._coordinator.shutdown()
+                self._release_process_lock()
+            self._release_process_lock()
             self._coordinator = None
             self._adapter = None
             self._executor = None
@@ -329,7 +447,19 @@ class MqttWorkerExtension:
             return
         if self._coordinator:
             self._coordinator.shutdown()
+            self._release_process_lock()
+        self._release_process_lock()
+        if not self._acquire_process_lock(workers_cfg):
+            self._release_process_lock()
+            self._coordinator = None
+            self._adapter = None
+            self._executor = None
+            self._identities = []
+            self._initialized = True
+            return
+
         self._identities = [WorkerIdentity(w) for w in workers_cfg]
+        emit("INFO", f"correlationId 去重窗口={DEDUP_WINDOW}s（同 id 在窗口内忽略，过期后可重新处理）")
         first = next((i for i in self._identities if i.enabled),
                      self._identities[0] if self._identities else None)
         agent_base = first.agent_id if first else "wbot"

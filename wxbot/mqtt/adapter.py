@@ -2,6 +2,7 @@
 """paho-mqtt 协议封装层（网络线程，不做任何 UI 调用）。"""
 from __future__ import annotations
 
+import os
 import uuid
 
 import paho.mqtt.client as paho
@@ -17,6 +18,7 @@ class MqttAdapter:
         self._message_handler = None
         self._connect_handler = None
         self._disconnect_handler = None
+        self._client_id = ""
 
     def set_handlers(self, on_connect=None, on_disconnect=None, on_message=None) -> None:
         self._connect_handler = on_connect
@@ -29,6 +31,7 @@ class MqttAdapter:
         host = broker.get("host", "localhost")
         port = broker.get("port", 1883)
         client_id = f"wbot_{self._agent_id}_{uuid.uuid4().hex[:8]}"
+        self._client_id = client_id
         # paho 2.x 默认 callback API v2（5 参），此处显式用 v1（4 参）以兼容回调签名
         try:
             client = paho.Client(client_id=client_id, clean_session=True,
@@ -50,7 +53,7 @@ class MqttAdapter:
         self._client.on_connect = self._on_connect
         self._client.on_disconnect = self._on_disconnect
         self._client.on_message = self._on_message
-        emit("INFO", f"正在连接 {host}:{port} (vhost={vhost}, tls={broker.get('tls')})")
+        emit("INFO", f"正在连接 {host}:{port} (vhost={vhost}, tls={broker.get('tls')}, client_id={client_id}, pid={os.getpid()})")
         self._client.connect(host, port, keepalive=60)
         self._client.loop_start()
         return True
@@ -96,11 +99,11 @@ class MqttAdapter:
         """paho 网络线程回调 — 仅解析入队。"""
         try:
             payload = msg.payload.decode("utf-8")
-            emit("INFO", f"⬇ MQTT 收到 topic={msg.topic} payload={payload}")
+            emit("INFO", f"⬇ MQTT 原始消息(待去重) topic={msg.topic} qos={getattr(msg, 'qos', '?')} mid={getattr(msg, 'mid', '?')} dup={getattr(msg, 'dup', '?')} retain={getattr(msg, 'retain', '?')} client_id={self._client_id} pid={os.getpid()} payload={payload}")
             if self._message_handler:
                 self._message_handler(msg.topic, payload)
         except Exception as e:
-            emit("ERROR", f"on_message 异常: {e}")
+            emit("ERROR", f"on_message 异常 client_id={self._client_id} pid={os.getpid()}: {e}")
 
     def shutdown(self) -> None:
         self.disconnect()

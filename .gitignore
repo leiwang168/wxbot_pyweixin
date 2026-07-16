@@ -7,6 +7,7 @@ config/webhook.json
 config/contacts_cache.json
 config/operate_cache.json
 config/pending_friends.json
+config/mqtt_worker_*.lock
 wxbot_*.log
 
 # PyInstaller 打包产物/残留

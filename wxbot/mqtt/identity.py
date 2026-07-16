@@ -59,11 +59,15 @@ class WorkerIdentity:
             return False
         now = time.time()
         with self._lock:
+            seen_at = self._seen_ids.get(cid)
+            if seen_at is not None:
+                age = now - seen_at
+                if age <= DEDUP_WINDOW:
+                    self._log("INFO", f"忽略重复消息 correlationId={cid} age={age:.1f}s window={DEDUP_WINDOW}s", self.role)
+                    return True
+                self._log("INFO", f"correlationId 去重已过期，允许重新处理 correlationId={cid} age={age:.1f}s window={DEDUP_WINDOW}s", self.role)
             cutoff = now - DEDUP_WINDOW
             self._seen_ids = {k: v for k, v in self._seen_ids.items() if v > cutoff}
-            if cid in self._seen_ids:
-                self._log("INFO", f"忽略重复消息 correlationId={cid}", self.role)
-                return True
             self._seen_ids[cid] = now
             return False
 

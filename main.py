@@ -131,8 +131,7 @@ def main() -> int:
     finally:
         monitor.stop()
         scheduler.stop()
-        if mqtt_worker._coordinator:
-            mqtt_worker._coordinator.shutdown()
+        mqtt_worker.shutdown()
         log.info("已退出")
     return 0
 
