@@ -398,19 +398,19 @@ def _red_packet_open_candidate_score(ctrl) -> int:
         return 0
 
     reject_words = (
-        "\u5df2\u9886\u53d6", "\u5df2\u9886\u5b8c", "\u5df2\u62a2\u5b8c",
-        "\u5df2\u8fc7\u671f", "\u624b\u6162\u4e86", "\u7ea2\u5305\u8bb0\u5f55",
-        "\u770b\u770b\u5927\u5bb6", "\u5fae\u4fe1\u7ea2\u5305", "\u9886\u53d6\u8be6\u60c5",
+        "已领取", "已领完", "已抢完",
+        "已过期", "手慢了", "红包记录",
+        "看看大家", "微信红包", "领取详情",
     )
     if any(word in text for word in reject_words):
         return 0
 
-    open_titles = ("\u62c6\u5f00", "\u5f00", "\u958b", "Open", "open")
+    open_titles = ("拆开", "开", "開", "Open", "open")
     ctype = _uia_control_type(ctrl)
 
     # In the red-packet popup, exact short labels are safe. For fuzzy Button text,
     # avoid matching generic one-character open labels inside unrelated labels.
-    fuzzy_titles = ("\u62c6\u5f00", "Open", "open")
+    fuzzy_titles = ("拆开", "Open", "open")
     if text not in open_titles and not (ctype == "Button" and any(title in text for title in fuzzy_titles)):
         return 0
 
@@ -481,11 +481,11 @@ def _log_red_packet_uia(root, limit: int = 80) -> None:
 def _click_red_packet_open_by_uia(red_view) -> bool:
     """Prefer UIA component lookup for the WeChat red-packet open button."""
     direct_specs = [
-        {"title": "\u62c6\u5f00", "control_type": "Button"},
-        {"title": "\u5f00", "control_type": "Button"},
-        {"title": "\u958b", "control_type": "Button"},
+        {"title": "拆开", "control_type": "Button"},
+        {"title": "开", "control_type": "Button"},
+        {"title": "開", "control_type": "Button"},
         {"title": "Open", "control_type": "Button"},
-        {"title_re": ".*\u62c6\u5f00.*", "control_type": "Button"},
+        {"title_re": ".*拆开.*", "control_type": "Button"},
         {"title_re": ".*Open.*", "control_type": "Button"},
     ]
     for spec in direct_specs:
@@ -766,8 +766,8 @@ def _open_red_packet(main_window, msg_item, chat: str) -> str | None:
         if screenshot_url:
             try:
                 mqtt_worker.on_wechat_message(
-                    chat, chat, "[\u5fae\u4fe1\u7ea2\u5305\u5df2\u67e5\u6536]",
-                    msg_type="\u5fae\u4fe1\u7ea2\u5305",
+                    chat, chat, "[微信红包已查收]",
+                    msg_type="微信红包",
                     file_url=screenshot_url,
                     file_name=f"hongbao_{chat}.png")
                 log.info(f"[red-packet] screenshot forwarded to MQTT: {chat}")
