@@ -30,17 +30,61 @@ Examples:
 '''
 import os
 import shutil
+import time
 import ctypes
+import threading
 import win32clipboard
+import pywintypes
 import ctypes
 from ctypes import cast, POINTER
 from comtypes import CLSCTX_ALL
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-import sounddevice as sd 
+import sounddevice as sd
 #常量
 ES_DISPLAY_REQUIRED=0x00000002
 ES_CONTINUOUS=0x80000000
 ES_CONTINUOUS=0x80000000
+
+# 剪贴板进程级锁：所有 Open/Empty/Set/Close 序列在锁内串行化，
+# 避免 executor 与 InputBlocker/scheduler/friends 等多线程并发操作剪贴板导致 1418 错误
+_clipboard_lock = threading.Lock()
+
+
+def _with_clipboard(work, *, retries=3, delay=0.05):
+    """串行化剪贴板访问，并对 Open/Empty 的 pywintypes.error(1418 等)有限重试。
+
+    work() 在剪贴板已打开时执行；无论成功失败都确保 CloseClipboard。
+    """
+    with _clipboard_lock:
+        last_err = None
+        for attempt in range(retries):
+            try:
+                win32clipboard.OpenClipboard()
+                try:
+                    return work()
+                finally:
+                    try:
+                        win32clipboard.CloseClipboard()
+                    except Exception:
+                        pass
+            except pywintypes.error as e:
+                last_err = e
+                try:
+                    win32clipboard.CloseClipboard()
+                except Exception:
+                    pass
+                if attempt < retries - 1:
+                    time.sleep(delay)
+                    continue
+            except Exception:
+                try:
+                    win32clipboard.CloseClipboard()
+                except Exception:
+                    pass
+                raise
+        if last_err is not None:
+            raise last_err
+
 
 class SystemSettings():
     '''
@@ -112,15 +156,14 @@ class SystemSettings():
         #获取文件绝对路径
         files=("\0".join(filepaths_list)).replace("/", "\\")
         data=files.encode("U16")[2:] + b"\0\0"#结尾一定要两个\0\0字符，这是规定！
-        win32clipboard.OpenClipboard()#打开剪贴板（独占）
-        try:
+        def _work():
             #若要将信息放在剪贴板上，首先需要使用 EmptyClipboard 函数清除当前的剪贴板内容
             win32clipboard.EmptyClipboard() #清空当前的剪贴板信息
             win32clipboard.SetClipboardData(win32clipboard.CF_HDROP,bytes(pDropFiles)+data) #设置当前剪贴板数据
+        try:
+            _with_clipboard(_work)
         except Exception as e:
             print(f"复制文件到剪贴板时出错！{e}")
-        finally:
-            win32clipboard.CloseClipboard()#最后,无论什么情况都关闭剪贴板
 
     @staticmethod
     def copy_file_to_clipboard(file_path:str):
@@ -143,15 +186,14 @@ class SystemSettings():
         #获取文件绝对路径
         files=file_path.replace("/", "\\")
         data=files.encode("U16")[2:]+b"\0\0"     #结尾一定要两个\0\0字符，这是规定！
-        win32clipboard.OpenClipboard()#打开剪贴板（独占）
-        try:
+        def _work():
             #若要将信息放在剪贴板上，首先需要使用 EmptyClipboard 函数清除当前的剪贴板内容
             win32clipboard.EmptyClipboard() #清空当前的剪贴板信息
             win32clipboard.SetClipboardData(win32clipboard.CF_HDROP,bytes(pDropFiles)+data)#设置当前剪贴板数据
+        try:
+            _with_clipboard(_work)
         except Exception:
             print("复制文件到剪贴板时出错！")
-        finally:
-            win32clipboard.CloseClipboard() #c出错后关闭剪贴板
     
     @staticmethod
     def copy_text_to_clipboard(text:str):
@@ -160,10 +202,13 @@ class SystemSettings():
         Args:
             text:字符串
         '''
-        win32clipboard.OpenClipboard()
-        win32clipboard.EmptyClipboard()
-        win32clipboard.SetClipboardText(text,win32clipboard.CF_UNICODETEXT)
-        win32clipboard.CloseClipboard()
+        def _work():
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardText(text,win32clipboard.CF_UNICODETEXT)
+        try:
+            _with_clipboard(_work)
+        except Exception as e:
+            print(f"复制文本到剪贴板失败: {e}")
 
     @staticmethod
     def convert_long_text_to_txt(LongText:str):
@@ -224,10 +269,14 @@ class SystemSettings():
             copied_text:粘贴到剪贴板的文本,如果没有返回空字符串
         '''
         copied_text=''
-        win32clipboard.OpenClipboard()
-        if win32clipboard.IsClipboardFormatAvailable(win32clipboard.CF_UNICODETEXT):
-            copied_text=win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT)
-        win32clipboard.CloseClipboard()
+        def _work():
+            nonlocal copied_text
+            if win32clipboard.IsClipboardFormatAvailable(win32clipboard.CF_UNICODETEXT):
+                copied_text=win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT)
+        try:
+            _with_clipboard(_work)
+        except Exception:
+            pass
         return copied_text
 
     @staticmethod
@@ -241,11 +290,15 @@ class SystemSettings():
         '''
         file_path=''
         is_saved=False
-        win32clipboard.OpenClipboard()
-        if win32clipboard.IsClipboardFormatAvailable(win32clipboard.CF_HDROP):
-            hdrop=win32clipboard.GetClipboardData(win32clipboard.CF_HDROP)
-            file_path=hdrop[0]
-        win32clipboard.CloseClipboard()
+        def _work():
+            nonlocal file_path
+            if win32clipboard.IsClipboardFormatAvailable(win32clipboard.CF_HDROP):
+                hdrop=win32clipboard.GetClipboardData(win32clipboard.CF_HDROP)
+                file_path=hdrop[0]
+        try:
+            _with_clipboard(_work)
+        except Exception:
+            pass
         try:
             shutil.copy2(file_path,image_path)
             is_saved=True
@@ -265,11 +318,15 @@ class SystemSettings():
         '''
         file_path=''
         is_saved=False
-        win32clipboard.OpenClipboard()
-        if win32clipboard.IsClipboardFormatAvailable(win32clipboard.CF_HDROP):
-            hdrop=win32clipboard.GetClipboardData(win32clipboard.CF_HDROP)
-            file_path=hdrop[0]
-        win32clipboard.CloseClipboard()
+        def _work():
+            nonlocal file_path
+            if win32clipboard.IsClipboardFormatAvailable(win32clipboard.CF_HDROP):
+                hdrop=win32clipboard.GetClipboardData(win32clipboard.CF_HDROP)
+                file_path=hdrop[0]
+        try:
+            _with_clipboard(_work)
+        except Exception:
+            pass
         if file_path.endswith('.mp4'):
             try:
                 shutil.copy2(file_path,video_path)

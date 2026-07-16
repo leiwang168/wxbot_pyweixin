@@ -385,7 +385,56 @@ A: `Ctrl+Alt+X` 解除，或发 `/解除屏蔽`，或等待 `auto_release_minute
 5. `check_new_friends` 有频率限制（单次≤8/每日≤4/间隔≥2h），调度取保守间隔。
 6. MQTT password、MinIO access_key/secret_key 明文存 `config.json`（本地配置可接受；共享配置建议改环境变量）。
 
-## 10. 目录结构
+## 10. 经验教训与踩坑记录
+
+> 本项目开发与运维中踩过的坑及沉淀的做法，供后续维护参考。
+
+### 10.1 UI 自动化：坐标系必须统一
+- **现象**：转账/红包 OpenCV 模板匹配后点击偏右；`click_input()` 点 ListItem 中心没点到消息卡片。
+- **根因**：`pywinauto` UIA 的 `rectangle()` 返回**物理像素**，`PIL.ImageGrab`/`pyautogui` 在 DPI 未感知进程中用**逻辑**坐标，混用导致系统性偏移；对方消息卡片靠左，ListItem 几何中心落在空白区。
+- **对策**：截图匹配优先用**全屏 `ImageGrab.grab()` + `pyautogui.click(max_loc + 模板/2)`**（PIL 与 pyautogui 同属 GDI 坐标系，参考 `_activate_weixin_by_cv`），不依赖 `rectangle()`；点击消息卡片按方向偏移（对方靠左点左 1/4）+ 换点重试（左→中→右）+ 点击后验证；入口尽早 `SetProcessDpiAwareness`。
+
+### 10.2 MQTT：消费端必须按 correlationId 幂等去重
+- **现象**：同一 `correlationId` 的发送任务被多次重投 → 好友收到重复消息。
+- **根因**：QoS1「至少一次」+ 上游超时重试；`identity.is_duplicate`（TTL 去重）已实现却**从未被调用**。
+- **对策**：入队层 `coordinator.enqueue_message` 调 `identity.is_duplicate(adapted)` 丢弃重复 cid。**写好的工具函数务必确认接入调用点，否则等于没写。**
+
+### 10.3 剪贴板是进程级全局资源，必须串行化
+- **现象**：发送消息偶发 `(1418, EmptyClipboard/CloseClipboard, 线程没有打开的剪贴板)`。
+- **根因**：`copy_text_to_clipboard` 无 `try/finally`；`InputBlocker._notify`/`scheduler._send_msgs`/`friends.send_greeting` 等后台线程**绕过 UI 锁**直接操作剪贴板，与持锁的 executor 并发。
+- **对策**：模块级 `_clipboard_lock` + `_with_clipboard(work)`（锁内 Open→work→Close，`try/finally` 保证关闭，1418 重试 3 次）。**一处加固覆盖所有调用方**，任何绕过 UI 锁的线程都共享这把锁。
+
+### 10.4 底层 UI 操作必须留节奏
+- **现象**：加好友/发朋友圈偶发失败（搜不到/按钮未就绪/请求丢失）。
+- **根因**：步骤间无缓冲，UI 元素未渲染就操作。
+- **对策**：底层（`WeChatAuto`）关键步骤间加 `time.sleep(0.3~1.0)` + `exists(timeout=)` 抬到 4s。上层 `pre_delay` 只控操作前等待，控不了「操作中」节奏——**节奏问题必须改底层**。
+
+### 10.5 主循环是心脏，多层兜底防单点退出
+- **对策**（`monitor.loop` / `main.py`）：单轮 `run_once` 放子线程 + `join(timeout)` 兜底 UI 死锁；`_run_once_safe` 捕获单轮异常 + 飞书告警（夜间静默、同异常 1h 去重）；`loop` while 体内再套 try/except；`main.py` 外层 `while True`+`except Exception` 意外退出 5s 自动恢复。**成本极低，收益是「永不静默死亡」。**
+
+### 10.6 锁重建：Python 杀不掉线程，靠身份比较自检
+- **现象**：UI 卡死后重建锁，旧线程恢复时误清新任务 event / 误操作 UI。
+- **根因**：Python 无法强制 kill 线程。
+- **对策**（`coordinator._rebuild_ui_lock`）：换新 Lock+新 Event+epoch+1；旧线程 `_exit` 用**锁对象身份比较**（`lock is cur_lock`）判断是否仍是活动锁，不是则跳过所有副作用、只释放自己的旧锁，**绝不误释放新锁**。
+
+### 10.7 跨线程共享状态要封装加锁
+- **现象**：`_last_sent` 防回环指纹由协调器写、转发读，跨线程裸 dict 访问。
+- **对策**：封装为 `record_last_sent()`/`is_recent_sent()`，内部 `_operate_lock` 保护。**不要让外部直接 `obj._dict[k]=v`。**
+
+### 10.8 微信「附属内容」常是独立列表项，且有时延
+- **现象**：语音转文字读不到/读到空。
+- **根因**：语音转文字结果是**下一条独立 ListItem**，且转换有延迟，收到语音时下一条可能未出现。
+- **对策**（`read_chat_messages`）：语音读下一条；若非文本（未完成）按 `voice_message_delay` 等待后**重读**，**只在未就绪时才等待**避免无谓阻塞。
+
+### 10.9 GUI 嵌套字段：变量前缀要避开通用保存循环
+- **现象**：GUI 把 minio/workers 字段变量存进 `_bool_vars`/`_str_vars`，通用循环误当顶层 config 字段写入（污染）。
+- **对策**：嵌套字段变量统一前缀（`minio_*`/`wk_*`/`mqtt_*`/`wh_*`/`ib_*`），通用循环按前缀跳过，单独组装回嵌套结构。
+
+### 10.10 微信输入框不要直接 set_text
+- **根因**：mmui 输入框直接 `set_text` 相当于默认 clear，行为不稳。
+- **对策**：`Messages.send_messages_to_friend` 走 `copy_text_to_clipboard` + `Ctrl+V` + `Alt+S`（配合 10.3 的剪贴板锁）。
+
+## 11. 目录结构
 
 ```
 wxbot_pyweixin/

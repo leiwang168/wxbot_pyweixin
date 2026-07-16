@@ -35,7 +35,9 @@ from pyweixin.Uielements import Main_window, SideBar
 
 from ..config import bot_config
 from ..input_blocker import input_blocker
-from ..wx_dialog import dismiss_wx_dialog
+from ..wx_dialog import (WxAddFriendRateLimited, detect_and_dismiss_wx_dialog,
+                         dismiss_wx_dialog, get_add_friend_rate_limit_retry_after,
+                         mark_add_friend_rate_limited)
 from .common import (MAX_CONTACT_LEN, MAX_HISTORY_LIMIT, MAX_MESSAGE_LEN,
                      MAX_TARGET_LEN, MAX_VERIFY_TEXT_LEN, emit)
 from .resolver import ContactResolver
@@ -60,6 +62,43 @@ class TaskExecutor:
         # 锁归属状态用 threading.local，避免共享 executor 的线程间并发覆盖
         # _exit_ui 用锁对象身份比较（held is self._ui_lock）判断锁是否被重建，无需 epoch
         self._ui_tls = threading.local()
+        self._add_friend_lock = threading.Lock()
+
+    def _add_friend_cooldown_seconds(self) -> int:
+        try:
+            seconds = int((bot_config.get("friend_add", {}) or {}).get(
+                "rate_limit_cooldown_seconds", 3600) or 3600)
+        except Exception:
+            seconds = 3600
+        return max(60, seconds)
+
+    def _add_friend_retry_after(self) -> int:
+        return get_add_friend_rate_limit_retry_after()
+
+    def _mark_add_friend_rate_limited(self, reason: str = "") -> int:
+        with self._add_friend_lock:
+            retry_after = mark_add_friend_rate_limited(
+                self._add_friend_cooldown_seconds(), reason)
+        self._log(
+            "WARNING",
+            f"微信加好友触发频率限制，暂停新的加好友任务 {retry_after}s: {reason}",
+        )
+        return retry_after
+
+    def _add_friend_rate_limited_result(self, reason: str, target: str = "",
+                                        retry_after: int | None = None) -> dict:
+        if retry_after is None:
+            retry_after = self._add_friend_retry_after()
+        return {
+            "status": "rate_limited",
+            "errorCode": "WECHAT_ADD_FRIEND_RATE_LIMITED",
+            "error": reason,
+            "reason": reason,
+            "target": target,
+            "retryAfterSeconds": max(0, int(retry_after or 0)),
+            "retryable": True,
+        }
+
 
     def _enter_ui(self) -> None:
         """获取 UI 锁 + 重置微信到聊天主页，确保后续操作从干净状态开始。
@@ -363,6 +402,12 @@ class TaskExecutor:
         if not target:
             return {"status": "error", "error": "缺少 target 参数"}
 
+        retry_after = self._add_friend_retry_after()
+        if retry_after > 0:
+            return self._add_friend_rate_limited_result(
+                f"好友添加暂停中：微信提示操作过于频繁，{retry_after}s 后可重试",
+                target, retry_after)
+
         listen_name = remark or target
         chat_only = permission == "仅聊天"
 
@@ -377,11 +422,21 @@ class TaskExecutor:
                 try:
                     nickname = FriendSettings.add_new_friend(number=target, greetings=verify_text or None,
                                                   remark=remark or None, chat_only=chat_only, close_weixin=False)
+                    dialog = detect_and_dismiss_wx_dialog()
+                    if dialog.dialog_type == "rate_limited":
+                        raise WxAddFriendRateLimited(dialog.text or "操作过于频繁，请稍后再试")
+                except WxAddFriendRateLimited as e:
+                    reason = str(e) or "操作过于频繁，请稍后再试"
+                    retry_after = self._mark_add_friend_rate_limited(reason)
+                    return self._add_friend_rate_limited_result(reason, target, retry_after)
                 except Exception as e:
-                    # 与主循环一致(monitor.py:735-742)：异常疑似弹框所致，用 OpenCV 模板匹配
-                    # 点掉 confirm/unlock 等弹窗按钮，保证下个任务/下一轮 monitor 在干净页面。
-                    # 仅清弹窗不重试，最终仍返回失败。
-                    self._log("WARNING", f"添加好友异常(疑似弹框)，OpenCV 清理弹窗: {e}")
+                    dialog = detect_and_dismiss_wx_dialog()
+                    if dialog.dialog_type == "rate_limited":
+                        reason = dialog.text or str(e) or "操作过于频繁，请稍后再试"
+                        retry_after = self._mark_add_friend_rate_limited(reason)
+                        return self._add_friend_rate_limited_result(reason, target, retry_after)
+                    # 兼容旧逻辑：未知弹窗仍尝试 OpenCV 清理，保证下个任务/monitor 页面干净。
+                    self._log("WARNING", f"添加好友异常(疑似弹框)，已尝试清理弹窗: {e}")
                     try:
                         dismiss_wx_dialog(Navigator.open_weixin(is_maximize=False))
                     except Exception as de:

@@ -131,6 +131,13 @@ def read_chat_messages(main_window, number: int = 5) -> list[tuple]:
         # 语音消息：检查下一条是否为转文字内容
         if mtype == "语音" and i + 1 < len(items):
             next_display, next_mtype, _ = classify_message(items[i + 1])
+            # 转文字可能尚未完成（下一条还不是文本），等待可配置延迟后重读
+            if next_mtype != "文本" or not next_display:
+                _voice_delay = float(bot_config.get("voice_message_delay", 5) or 0)
+                if _voice_delay > 0:
+                    log.info(f"[语音] 等待 {_voice_delay}s 待转文字完成")
+                    time.sleep(_voice_delay)
+                    next_display, next_mtype, _ = classify_message(items[i + 1])
             if next_mtype == "文本" and next_display:
                 display = f"{display} | 转文字: {next_display}"
                 i += 1  # 跳过下一条（已合并）
@@ -187,6 +194,21 @@ def _is_system_greeting(text: str) -> bool:
     return any(k in (text or '') for k in kws)
 
 
+def _message_runtime_key(chat: str, msg_type: str, msg_item, scope: str = "MSG") -> str:
+    """Return a UI-element based duplicate key; never falls back to message text."""
+    if msg_item is None:
+        return ""
+    try:
+        runtime_id = getattr(msg_item.element_info, "runtime_id", None)
+    except Exception:
+        runtime_id = None
+    if not runtime_id:
+        return ""
+    if isinstance(runtime_id, (list, tuple)):
+        runtime_id = ".".join(str(x) for x in runtime_id)
+    return f"{chat}:{scope}:{msg_type}:RID:{runtime_id}"
+
+
 def _confirm_transfer(main_window, msg_item, chat: str) -> bool:
     """确认收款好友转账。返回是否收款成功。
 
@@ -201,24 +223,34 @@ def _confirm_transfer(main_window, msg_item, chat: str) -> bool:
     from .paths import get_images_dir
     _TEMPLATE_DIR = get_images_dir()
     try:
-        # 点击转账消息打开详情窗口
-        msg_item.click_input()
-        time.sleep(1.5)
-        # 详情窗口是独立弹出
-        desktop = Desktop(backend='uia')
+        # 点击转账消息卡片打开详情窗口：对方卡片靠左，ListItem 几何中心可能落空，
+        # 按 rectangle 换点（左1/4→中→右1/4）点击，每次后检查详情窗口是否弹出
+        mr = msg_item.rectangle()
+        mw, mh = mr.right - mr.left, mr.bottom - mr.top
         detail = None
-        for w in desktop.windows():
+        for frac in (0.25, 0.5, 0.75):
+            cx, cy = int(mr.left + mw * frac), int(mr.top + mh / 2)
+            log.info(f"[转账收款] 点击消息卡片 ({cx},{cy}) rect=({mr.left},{mr.top},{mr.right},{mr.bottom}) frac={frac}")
             try:
-                if not w.is_visible():
+                pyautogui.click(cx, cy)
+            except Exception as ce:
+                log.warning(f"[转账收款] 点击异常: {ce}")
+            time.sleep(1.5)
+            desktop = Desktop(backend='uia')
+            for w in desktop.windows():
+                try:
+                    if not w.is_visible():
+                        continue
+                    cn = w.element_info.class_name or ''
+                    if cn.startswith('mmui::') and cn != 'mmui::MainWindow':
+                        detail = w
+                        break
+                except Exception:
                     continue
-                cn = w.element_info.class_name or ''
-                if cn.startswith('mmui::') and cn != 'mmui::MainWindow':
-                    detail = w
-                    break
-            except Exception:
-                continue
+            if detail:
+                break
         if not detail:
-            log.warning(f"[转账收款] {chat} 详情窗口未弹出")
+            log.warning(f"[转账收款] {chat} 详情窗口未弹出（已尝试3个点击位置）")
             return False
         r = detail.rectangle()
         log.info(f"[转账收款] 详情窗口 rect=({r.left},{r.top},{r.right},{r.bottom})")
@@ -280,44 +312,47 @@ def _open_red_packet(main_window, msg_item, chat: str) -> str | None:
     from .paths import get_images_dir
     _TEMPLATE_DIR = get_images_dir()
     try:
-        # 点击红包消息，红包详情会显示在聊天对话区域正中心
-        msg_item.click_input()
-        time.sleep(1.5)
-        # 以聊天消息列表区域（FriendChatList）为截图区域
+        # 点击红包消息卡片：对方卡片靠左，ListItem 几何中心可能落空；
+        # 按 rectangle 换点（左1/4→中→右1/4）点击，每次后用 OpenCV 匹配"开"按钮验证
         chat_list = main_window.child_window(**Lists.FriendChatList)
-        if not chat_list.exists(timeout=1):
-            log.warning(f"[微信红包] {chat} 找不到聊天消息列表")
-            return None
-        r = chat_list.rectangle()
-        log.info(f"[微信红包] 聊天区域 rect=({r.left},{r.top},{r.right},{r.bottom})")
-
-        # OpenCV 模板匹配定位"开"按钮
         open_template = cv2.imread(_os.path.join(_TEMPLATE_DIR, 'hongbao_btn.png'),
                                    cv2.IMREAD_COLOR)
         if open_template is None:
             log.warning("[微信红包] 开按钮模板图不存在")
             pyautogui.press('esc')
             return None
-
-        # 截取聊天区域，模板匹配找"开"按钮
-        shot_pil = ImageGrab.grab(bbox=(r.left, r.top, r.right, r.bottom))
-        shot = cv2.cvtColor(np.array(shot_pil), cv2.COLOR_RGB2BGR)
         th, tw = open_template.shape[:2]
-        if shot.shape[0] < th or shot.shape[1] < tw:
-            log.warning(f"[微信红包] 聊天区域截图({shot.shape})小于模板({open_template.shape})")
+        mr = msg_item.rectangle()
+        mw, mh = mr.right - mr.left, mr.bottom - mr.top
+        r = None
+        click_x = click_y = 0
+        for frac in (0.25, 0.5, 0.75):
+            cx, cy = int(mr.left + mw * frac), int(mr.top + mh / 2)
+            log.info(f"[微信红包] 点击消息卡片 ({cx},{cy}) rect=({mr.left},{mr.top},{mr.right},{mr.bottom}) frac={frac}")
+            try:
+                pyautogui.click(cx, cy)
+            except Exception as ce:
+                log.warning(f"[微信红包] 点击异常: {ce}")
+            time.sleep(1.5)
+            if not chat_list.exists(timeout=1):
+                continue
+            rr = chat_list.rectangle()
+            shot_pil = ImageGrab.grab(bbox=(rr.left, rr.top, rr.right, rr.bottom))
+            shot = cv2.cvtColor(np.array(shot_pil), cv2.COLOR_RGB2BGR)
+            if shot.shape[0] < th or shot.shape[1] < tw:
+                continue
+            res = cv2.matchTemplate(shot, open_template, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, max_loc = cv2.minMaxLoc(res)
+            log.info(f"[微信红包] 模板匹配置信度={max_val:.3f} 位置={max_loc} frac={frac} rect=({rr.left},{rr.top},{rr.right},{rr.bottom})")
+            if max_val >= 0.6:
+                r = rr
+                click_x = rr.left + max_loc[0] + tw // 2
+                click_y = rr.top + max_loc[1] + th // 2
+                break
+        if r is None:
+            log.warning(f"[微信红包] {chat} 未点开红包或未匹配到开按钮（已尝试3个点击位置）")
             pyautogui.press('esc')
             return None
-        res = cv2.matchTemplate(shot, open_template, cv2.TM_CCOEFF_NORMED)
-        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
-        log.info(f"[微信红包] 模板匹配置信度={max_val:.3f} 位置={max_loc}")
-        if max_val < 0.6:
-            log.warning(f"[微信红包] 未匹配到开按钮(置信度{max_val:.3f}<0.6)")
-            pyautogui.press('esc')
-            return None
-
-        # 点击"开"按钮（max_loc 是模板左上角在截图中的位置，转为屏幕坐标）
-        click_x = r.left + max_loc[0] + tw // 2
-        click_y = r.top + max_loc[1] + th // 2
         log.info(f"[微信红包] 点击开按钮 ({click_x}, {click_y})")
         pyautogui.click(click_x, click_y)
         time.sleep(3)
@@ -336,6 +371,8 @@ def _open_red_packet(main_window, msg_item, chat: str) -> str | None:
             tmp = _os.path.join(tempfile.gettempdir(), f'hongbao_{int(time.time())}.png')
             ImageGrab.grab(bbox=(wr.left, wr.top, wr.right, wr.bottom)).save(tmp)
             log.info(f"[微信红包] 截图已保存: {tmp}")
+            # 确保关闭所有红包相关弹窗
+            pyautogui.press('esc')
             # 上传 MinIO（失败返回 None，让调用方回退到文本转发）
             uploader = mqtt_worker._uploader if mqtt_worker._coordinator else None
             if uploader and getattr(uploader, 'available', False):
@@ -360,8 +397,6 @@ def _open_red_packet(main_window, msg_item, chat: str) -> str | None:
         except Exception as e:
             log.warning(f"[微信红包] 截图上传异常: {e}")
 
-        # 确保关闭所有红包相关弹窗
-        pyautogui.press('esc')
         time.sleep(0.3)
 
         # 转发 MQTT：红包拆开 + 截图 URL
@@ -455,8 +490,12 @@ def _process_one(main_window, chat: str, sender: str, text: str,
             log.info(f"[系统消息] 好友通过验证,忽略红点,由 pending 机制统一模拟转发")
         return
     if msg_type in ("被拉黑", "被删除"):
+        alert_id = _message_runtime_key(chat, msg_type, msg_item, scope="ALERT")
+        if alert_id:
+            if alert_id in processed:
+                return
+            processed.add(alert_id)
         log.warning(f"⚠️ {chat} 可能{msg_type}: {text!r}")
-        processed.add(f"{chat}:{msg_type}:{text}")
         kind = "blocked" if msg_type == "被拉黑" else "deleted"
         try:
             mqtt_worker.notify_contact_unreachable(
@@ -474,22 +513,25 @@ def _process_one(main_window, chat: str, sender: str, text: str,
 
     # /指令（仅 admin，不受监听过滤限制）
     if text.startswith("/") and commands.is_admin(sender):
+        cmd_id = _message_runtime_key(chat, "command", msg_item, scope="CMD")
+        if cmd_id:
+            if cmd_id in processed:
+                return
+            processed.add(cmd_id)
         reply = commands.handle(text)
-        processed.add(f"{chat}:CMD:{text}")  # 无论是否有回复都去重，避免每轮重复执行
         if reply:
             _send_to_chat(main_window, chat, split_long_text(reply), current_friend)
         return
 
-    msg_id = f"{chat}:{msg_type}:{text}"
-    # 媒体消息(图片/视频/文件)text 可能相同(如多张图片都是"图片")，用 runtime_id 区分避免误去重
-    if msg_item is not None and msg_type in ("图片", "视频", "文件"):
-        try:
-            msg_id = f"{chat}:{msg_type}:{msg_item.element_info.runtime_id}"
-        except Exception:
-            pass
-    if msg_id in processed:
-        return
-    processed.add(msg_id)
+    # Do not dedupe by message content: users may send identical text repeatedly.
+    # Only use WeChat UI runtime_id to skip the same UI item across polling rounds.
+    # If runtime_id is unavailable, let it pass; never fall back to text/content.
+    msg_id = _message_runtime_key(chat, msg_type, msg_item)
+    if msg_id:
+        if msg_id in processed:
+            return
+        processed.add(msg_id)
+
 
     log.info(f"[收到] {chat}({sender}) [{msg_type}]: {text!r}")
 
@@ -551,7 +593,6 @@ def _process_one(main_window, chat: str, sender: str, text: str,
     reply_msgs = reply_engine.decide_reply(chat, sender, text, msg_type, is_group)
     if reply_msgs:
         _send_to_chat(main_window, chat, reply_msgs, current_friend)
-        processed.add(f"{chat}:REPLY:{reply_msgs[0]}")
         log.info(f"[已回复] {chat}: {reply_msgs[0]!r}")
 
     # 自定义转发（在 AI/关键词回复之后执行）
@@ -584,10 +625,12 @@ def _group_monitor_forward(main_window, chat: str, sender: str, text: str,
     targets = match_group_monitor(chat, text)
     if not targets:
         return False
-    gmon_id = f"{chat}:GMON:{text}"
-    if gmon_id in processed:
-        return False
-    processed.add(gmon_id)
+    # Group monitor also avoids content-based dedupe for repeated keyword messages.
+    gmon_id = _message_runtime_key(chat, "group_monitor", msg_item, scope="GMON")
+    if gmon_id:
+        if gmon_id in processed:
+            return False
+        processed.add(gmon_id)
     sender_real = ""
     try:
         sender_real = read_group_sender(msg_item)

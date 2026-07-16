@@ -39,6 +39,7 @@ DEFAULTS: dict[str, Any] = {
     "monitor_check_interval": 10,        # 消息监听轮询间隔（秒）
     "monitor_run_timeout": 30,           # 单轮 run_once 超时（秒），防 UI 操作死锁拖垮主循环
     "contacts_refresh_timeout": 300,     # 联系人全量缓存刷新超时（秒），config 可配
+    "voice_message_delay": 5,            # 收到语音消息后等待转文字的延迟（秒），0=不等待
     # 关键词
     "chat_keyword_switch": False,
     "group_keyword_switch": False,
