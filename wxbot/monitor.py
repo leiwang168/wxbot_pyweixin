@@ -209,17 +209,333 @@ def _message_runtime_key(chat: str, msg_type: str, msg_item, scope: str = "MSG")
     return f"{chat}:{scope}:{msg_type}:RID:{runtime_id}"
 
 
+def _uia_text(ctrl) -> str:
+    try:
+        return ctrl.window_text() or ""
+    except Exception:
+        return ""
+
+
+def _uia_control_type(ctrl) -> str:
+    try:
+        return ctrl.element_info.control_type or ""
+    except Exception:
+        return ""
+
+
+def _uia_class_name(ctrl) -> str:
+    try:
+        return ctrl.element_info.class_name or ""
+    except Exception:
+        return ""
+
+
+def _uia_automation_id(ctrl) -> str:
+    try:
+        return ctrl.element_info.automation_id or ""
+    except Exception:
+        return ""
+
+
+def _uia_rect(ctrl):
+    try:
+        return ctrl.rectangle()
+    except Exception:
+        return None
+
+
+def _uia_rect_str(ctrl) -> str:
+    r = _uia_rect(ctrl)
+    if not r:
+        return "(unknown)"
+    return f"({r.left},{r.top},{r.right},{r.bottom})"
+
+
+def _uia_click_control(ctrl, reason: str, tag: str = "[UIA]") -> bool:
+    """Click a UIA control, falling back to rectangle-center click when invoke fails."""
+    try:
+        if hasattr(ctrl, "is_visible") and not ctrl.is_visible():
+            return False
+    except Exception:
+        pass
+    try:
+        if hasattr(ctrl, "is_enabled") and not ctrl.is_enabled():
+            return False
+    except Exception:
+        pass
+
+    text = _uia_text(ctrl)
+    ctype = _uia_control_type(ctrl)
+    cls = _uia_class_name(ctrl)
+    auto_id = _uia_automation_id(ctrl)
+    rect = _uia_rect(ctrl)
+    log.info(
+        f"{tag} UIA click candidate reason={reason} type={ctype} text={text!r} "
+        f"class={cls!r} automation_id={auto_id!r} rect={_uia_rect_str(ctrl)}"
+    )
+    try:
+        ctrl.click_input()
+        return True
+    except Exception as e:
+        log.warning(f"{tag} UIA click_input failed; trying center click: {e}")
+    if not rect:
+        return False
+    try:
+        pyautogui.click(int((rect.left + rect.right) / 2), int((rect.top + rect.bottom) / 2))
+        return True
+    except Exception as e:
+        log.warning(f"{tag} UIA center click failed: {e}")
+        return False
+
+
+def _transfer_collect_candidate_score(ctrl) -> int:
+    """Return >0 when a UIA element looks like the transfer collect button."""
+    text = _uia_text(ctrl).strip()
+    if not text:
+        return 0
+
+    # Completed/status labels are not actionable collect buttons.
+    reject_words = ("待你收款", "你已收款", "已收款", "已退还", "已被领取", "零钱")
+    if any(word in text for word in reject_words):
+        return 0
+
+    collect_titles = ("收款", "确认收款", "確認收款", "立即收款")
+    ctype = _uia_control_type(ctrl)
+
+    # Be conservative: non-button controls must be exact labels, otherwise text such as
+    # "收款方" or "收款账户" may be a status/description and should fall back to OpenCV.
+    if text not in collect_titles and not (ctype == "Button" and any(title in text for title in collect_titles)):
+        return 0
+
+    score = 10
+    if text in collect_titles:
+        score += 40
+    if ctype == "Button":
+        score += 30
+    elif ctype in ("Custom", "Text", "Pane", "Group"):
+        score += 10
+    return score
+
+
+def _log_transfer_detail_uia(detail, limit: int = 80) -> None:
+    """Log transfer-detail UIA controls for diagnosing WeChat/DPI changes."""
+    try:
+        controls = detail.descendants()
+    except Exception as e:
+        log.warning(f"[转账收款] UIA控件树读取失败: {e}")
+        return
+
+    rows = []
+    for idx, ctrl in enumerate(controls[:limit]):
+        text = _uia_text(ctrl)
+        ctype = _uia_control_type(ctrl)
+        score = _transfer_collect_candidate_score(ctrl)
+        # Always keep likely candidates; otherwise only log non-empty text to avoid noise.
+        if score > 0 or text:
+            rows.append(
+                f"#{idx} score={score} type={ctype} text={text!r} "
+                f"class={_uia_class_name(ctrl)!r} automation_id={_uia_automation_id(ctrl)!r} "
+                f"rect={_uia_rect_str(ctrl)}"
+            )
+    if rows:
+        log.info("[转账收款] UIA详情控件摘要:\n" + "\n".join(rows[:limit]))
+    else:
+        log.info(f"[转账收款] UIA详情控件摘要为空 descendants={len(controls)}")
+
+
+def _click_transfer_collect_by_uia(detail) -> bool:
+    """Prefer UIA component lookup for the WeChat transfer collect button."""
+    direct_specs = [
+        {"title": "收款", "control_type": "Button"},
+        {"title": "确认收款", "control_type": "Button"},
+        {"title": "確認收款", "control_type": "Button"},
+        {"title_re": ".*收款.*", "control_type": "Button"},
+    ]
+    for spec in direct_specs:
+        try:
+            btn = detail.child_window(**spec)
+            if btn.exists(timeout=0.2):
+                wrapper = btn.wrapper_object()
+                if _transfer_collect_candidate_score(wrapper) > 0:
+                    return _uia_click_control(wrapper, f"child_window({spec})", tag="[transfer]")
+        except Exception as e:
+            log.debug(f"[转账收款] UIA直接定位未命中 spec={spec}: {e}")
+
+    try:
+        controls = detail.descendants()
+    except Exception as e:
+        log.warning(f"[转账收款] UIA descendants读取失败: {e}")
+        return False
+
+    candidates = []
+    for ctrl in controls:
+        score = _transfer_collect_candidate_score(ctrl)
+        if score > 0:
+            candidates.append((score, ctrl))
+    if not candidates:
+        _log_transfer_detail_uia(detail)
+        return False
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    log.info(
+        "[转账收款] UIA收款候选: "
+        + "; ".join(
+            f"score={score} type={_uia_control_type(ctrl)} text={_uia_text(ctrl)!r} "
+            f"rect={_uia_rect_str(ctrl)}"
+            for score, ctrl in candidates[:5]
+        )
+    )
+    for score, ctrl in candidates[:3]:
+        if _uia_click_control(ctrl, f"descendant_score={score}", tag="[transfer]"):
+            return True
+    return False
+
+
+def _red_packet_open_candidate_score(ctrl) -> int:
+    """Return >0 when a UIA element looks like the red-packet open button."""
+    text = _uia_text(ctrl).strip()
+    if not text:
+        return 0
+
+    reject_words = (
+        "\u5df2\u9886\u53d6", "\u5df2\u9886\u5b8c", "\u5df2\u62a2\u5b8c",
+        "\u5df2\u8fc7\u671f", "\u624b\u6162\u4e86", "\u7ea2\u5305\u8bb0\u5f55",
+        "\u770b\u770b\u5927\u5bb6", "\u5fae\u4fe1\u7ea2\u5305", "\u9886\u53d6\u8be6\u60c5",
+    )
+    if any(word in text for word in reject_words):
+        return 0
+
+    open_titles = ("\u62c6\u5f00", "\u5f00", "\u958b", "Open", "open")
+    ctype = _uia_control_type(ctrl)
+
+    # In the red-packet popup, exact short labels are safe. For fuzzy Button text,
+    # avoid matching generic one-character open labels inside unrelated labels.
+    fuzzy_titles = ("\u62c6\u5f00", "Open", "open")
+    if text not in open_titles and not (ctype == "Button" and any(title in text for title in fuzzy_titles)):
+        return 0
+
+    score = 10
+    if text in open_titles:
+        score += 40
+    if ctype == "Button":
+        score += 30
+    elif ctype in ("Custom", "Text", "Pane", "Group"):
+        score += 10
+    return score
+
+
+def _find_red_packet_view(main_window):
+    """Find the red-packet receive popup/group after clicking a red packet message."""
+    specs = [
+        {"class_name": "mmui::PayRedEnvelopeInfoView", "control_type": "Group"},
+        {"class_name": "mmui::PayRedEnvelopReceiveWindow", "control_type": "Window"},
+        {"class_name": "mmui::PayRedEnvelopeReceiveWindow", "control_type": "Window"},
+    ]
+    for spec in specs:
+        try:
+            view = main_window.child_window(**spec)
+            if view.exists(timeout=0.2):
+                return view.wrapper_object()
+        except Exception:
+            pass
+
+    try:
+        for ctrl in main_window.descendants():
+            cls = _uia_class_name(ctrl)
+            if cls in (
+                "mmui::PayRedEnvelopeInfoView",
+                "mmui::PayRedEnvelopReceiveWindow",
+                "mmui::PayRedEnvelopeReceiveWindow",
+            ):
+                return ctrl
+    except Exception as e:
+        log.debug(f"[red-packet] UIA view scan failed: {e}")
+    return None
+
+
+def _log_red_packet_uia(root, limit: int = 80) -> None:
+    """Log red-packet popup UIA controls for diagnosing WeChat/DPI changes."""
+    try:
+        controls = root.descendants()
+    except Exception as e:
+        log.warning(f"[red-packet] UIA tree read failed: {e}")
+        return
+
+    rows = []
+    for idx, ctrl in enumerate(controls[:limit]):
+        text = _uia_text(ctrl)
+        ctype = _uia_control_type(ctrl)
+        score = _red_packet_open_candidate_score(ctrl)
+        if score > 0 or text:
+            rows.append(
+                f"#{idx} score={score} type={ctype} text={text!r} "
+                f"class={_uia_class_name(ctrl)!r} automation_id={_uia_automation_id(ctrl)!r} "
+                f"rect={_uia_rect_str(ctrl)}"
+            )
+    if rows:
+        log.info("[red-packet] UIA popup controls:\n" + "\n".join(rows[:limit]))
+    else:
+        log.info(f"[red-packet] UIA popup controls empty descendants={len(controls)}")
+
+
+def _click_red_packet_open_by_uia(red_view) -> bool:
+    """Prefer UIA component lookup for the WeChat red-packet open button."""
+    direct_specs = [
+        {"title": "\u62c6\u5f00", "control_type": "Button"},
+        {"title": "\u5f00", "control_type": "Button"},
+        {"title": "\u958b", "control_type": "Button"},
+        {"title": "Open", "control_type": "Button"},
+        {"title_re": ".*\u62c6\u5f00.*", "control_type": "Button"},
+        {"title_re": ".*Open.*", "control_type": "Button"},
+    ]
+    for spec in direct_specs:
+        try:
+            btn = red_view.child_window(**spec)
+            if btn.exists(timeout=0.2):
+                wrapper = btn.wrapper_object()
+                if _red_packet_open_candidate_score(wrapper) > 0:
+                    return _uia_click_control(wrapper, f"red_packet_child_window({spec})", tag="[red-packet]")
+        except Exception as e:
+            log.debug(f"[red-packet] direct UIA lookup missed spec={spec}: {e}")
+
+    try:
+        controls = red_view.descendants()
+    except Exception as e:
+        log.warning(f"[red-packet] UIA descendants read failed: {e}")
+        return False
+
+    candidates = []
+    for ctrl in controls:
+        score = _red_packet_open_candidate_score(ctrl)
+        if score > 0:
+            candidates.append((score, ctrl))
+    if not candidates:
+        _log_red_packet_uia(red_view)
+        return False
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    log.info(
+        "[red-packet] UIA open-button candidates: "
+        + "; ".join(
+            f"score={score} type={_uia_control_type(ctrl)} text={_uia_text(ctrl)!r} "
+            f"rect={_uia_rect_str(ctrl)}"
+            for score, ctrl in candidates[:5]
+        )
+    )
+    for score, ctrl in candidates[:3]:
+        if _uia_click_control(ctrl, f"red_packet_descendant_score={score}", tag="[red-packet]"):
+            return True
+    return False
+
+
 def _confirm_transfer(main_window, msg_item, chat: str) -> bool:
     """确认收款好友转账。返回是否收款成功。
 
     转账消息文本含"待你收款"（待收款状态）。点击转账消息弹出独立详情窗口 →
-    OpenCV 模板匹配定位"收款"按钮 → 点击收款 → Esc 关闭结果弹窗。
+    优先 UIA 控件定位"收款"按钮 → OpenCV 模板兜底 → Esc 关闭结果弹窗。
     """
-    import cv2
-    import numpy as np
     import os as _os
     from pywinauto import Desktop
-    from PIL import ImageGrab
     from .paths import get_images_dir
     _TEMPLATE_DIR = get_images_dir()
     try:
@@ -253,9 +569,25 @@ def _confirm_transfer(main_window, msg_item, chat: str) -> bool:
             log.warning(f"[转账收款] {chat} 详情窗口未弹出（已尝试3个点击位置）")
             return False
         r = detail.rectangle()
-        log.info(f"[转账收款] 详情窗口 rect=({r.left},{r.top},{r.right},{r.bottom})")
+        log.info(
+            f"[转账收款] 详情窗口 title={_uia_text(detail)!r} class={_uia_class_name(detail)!r} "
+            f"automation_id={_uia_automation_id(detail)!r} rect=({r.left},{r.top},{r.right},{r.bottom})"
+        )
+
+        # UIA component lookup is resolution/DPI independent. Use OpenCV only as fallback.
+        if _click_transfer_collect_by_uia(detail):
+            time.sleep(3)
+            pyautogui.press('esc')
+            log.info(f"[转账收款] UIA收款成功: {chat}")
+            return True
+
+        log.warning("[转账收款] UIA未定位到收款按钮，降级OpenCV模板匹配")
 
         # OpenCV 模板匹配定位"收款"按钮
+        import cv2
+        import numpy as np
+        from PIL import ImageGrab
+
         collect_template = cv2.imread(_os.path.join(_TEMPLATE_DIR, 'shoukuan_btn.png'),
                                       cv2.IMREAD_COLOR)
         if collect_template is None:
@@ -298,13 +630,11 @@ def _confirm_transfer(main_window, msg_item, chat: str) -> bool:
         return False
 
 def _open_red_packet(main_window, msg_item, chat: str) -> str | None:
-    """拆开好友红包。返回截图 URL（服务端识别金额），失败返回 None。
+    """Open a WeChat red packet. Return uploaded screenshot URL, or None on failure.
 
-    点击红包消息 → OpenCV 模板匹配定位"开"按钮 → 点击拆开 →
-    截图上传 MinIO → 转发 MQTT → Esc 关闭。
+    Flow: click red-packet message -> prefer UIA component lookup for the open button ->
+    fall back to OpenCV template matching -> screenshot result -> upload/forward -> Esc.
     """
-    import cv2
-    import numpy as np
     import os as _os
     import tempfile
     from pywinauto import Desktop
@@ -312,109 +642,142 @@ def _open_red_packet(main_window, msg_item, chat: str) -> str | None:
     from .paths import get_images_dir
     _TEMPLATE_DIR = get_images_dir()
     try:
-        # 点击红包消息卡片：对方卡片靠左，ListItem 几何中心可能落空；
-        # 按 rectangle 换点（左1/4→中→右1/4）点击，每次后用 OpenCV 匹配"开"按钮验证
         chat_list = main_window.child_window(**Lists.FriendChatList)
-        open_template = cv2.imread(_os.path.join(_TEMPLATE_DIR, 'hongbao_btn.png'),
-                                   cv2.IMREAD_COLOR)
-        if open_template is None:
-            log.warning("[微信红包] 开按钮模板图不存在")
-            pyautogui.press('esc')
-            return None
-        th, tw = open_template.shape[:2]
         mr = msg_item.rectangle()
         mw, mh = mr.right - mr.left, mr.bottom - mr.top
-        r = None
-        click_x = click_y = 0
+        fallback_rect = None
+        opened = False
+        open_template = None
+        template_shape = None
+
         for frac in (0.25, 0.5, 0.75):
             cx, cy = int(mr.left + mw * frac), int(mr.top + mh / 2)
-            log.info(f"[微信红包] 点击消息卡片 ({cx},{cy}) rect=({mr.left},{mr.top},{mr.right},{mr.bottom}) frac={frac}")
+            log.info(f"[red-packet] click message card ({cx},{cy}) rect=({mr.left},{mr.top},{mr.right},{mr.bottom}) frac={frac}")
             try:
                 pyautogui.click(cx, cy)
             except Exception as ce:
-                log.warning(f"[微信红包] 点击异常: {ce}")
-            time.sleep(1.5)
-            if not chat_list.exists(timeout=1):
-                continue
-            rr = chat_list.rectangle()
-            shot_pil = ImageGrab.grab(bbox=(rr.left, rr.top, rr.right, rr.bottom))
-            shot = cv2.cvtColor(np.array(shot_pil), cv2.COLOR_RGB2BGR)
-            if shot.shape[0] < th or shot.shape[1] < tw:
-                continue
-            res = cv2.matchTemplate(shot, open_template, cv2.TM_CCOEFF_NORMED)
-            _, max_val, _, max_loc = cv2.minMaxLoc(res)
-            log.info(f"[微信红包] 模板匹配置信度={max_val:.3f} 位置={max_loc} frac={frac} rect=({rr.left},{rr.top},{rr.right},{rr.bottom})")
-            if max_val >= 0.6:
-                r = rr
-                click_x = rr.left + max_loc[0] + tw // 2
-                click_y = rr.top + max_loc[1] + th // 2
-                break
-        if r is None:
-            log.warning(f"[微信红包] {chat} 未点开红包或未匹配到开按钮（已尝试3个点击位置）")
+                log.warning(f"[red-packet] message-card click failed: {ce}")
+            time.sleep(1.2)
+
+            red_view = _find_red_packet_view(main_window)
+            if red_view:
+                vr = _uia_rect(red_view)
+                if vr:
+                    fallback_rect = vr
+                log.info(
+                    f"[red-packet] popup/view title={_uia_text(red_view)!r} class={_uia_class_name(red_view)!r} "
+                    f"automation_id={_uia_automation_id(red_view)!r} rect={_uia_rect_str(red_view)}"
+                )
+                if _click_red_packet_open_by_uia(red_view):
+                    opened = True
+                    log.info(f"[red-packet] UIA open click succeeded: {chat}")
+                    break
+                log.warning("[red-packet] UIA did not find open button; trying OpenCV fallback")
+
+            # OpenCV fallback: kept for icon-only buttons or older WeChat builds whose UIA tree is incomplete.
+            try:
+                if open_template is None:
+                    import cv2
+                    import numpy as np
+                    open_template = cv2.imread(_os.path.join(_TEMPLATE_DIR, 'hongbao_btn.png'), cv2.IMREAD_COLOR)
+                    if open_template is None:
+                        log.warning("[red-packet] hongbao_btn.png missing; OpenCV fallback unavailable")
+                        continue
+                    template_shape = open_template.shape[:2]
+                else:
+                    import cv2
+                    import numpy as np
+
+                if not chat_list.exists(timeout=1):
+                    continue
+                rr = chat_list.rectangle()
+                fallback_rect = rr
+                shot_pil = ImageGrab.grab(bbox=(rr.left, rr.top, rr.right, rr.bottom))
+                shot = cv2.cvtColor(np.array(shot_pil), cv2.COLOR_RGB2BGR)
+                th, tw = template_shape
+                if shot.shape[0] < th or shot.shape[1] < tw:
+                    continue
+                res = cv2.matchTemplate(shot, open_template, cv2.TM_CCOEFF_NORMED)
+                _, max_val, _, max_loc = cv2.minMaxLoc(res)
+                log.info(f"[red-packet] OpenCV confidence={max_val:.3f} loc={max_loc} frac={frac} rect=({rr.left},{rr.top},{rr.right},{rr.bottom})")
+                if max_val >= 0.6:
+                    click_x = rr.left + max_loc[0] + tw // 2
+                    click_y = rr.top + max_loc[1] + th // 2
+                    log.info(f"[red-packet] OpenCV click open button ({click_x}, {click_y})")
+                    pyautogui.click(click_x, click_y)
+                    opened = True
+                    break
+            except Exception as e:
+                log.warning(f"[red-packet] OpenCV fallback failed: {e}")
+
+        if not opened:
+            log.warning(f"[red-packet] {chat} not opened; no open button found after 3 card clicks")
             pyautogui.press('esc')
             return None
-        log.info(f"[微信红包] 点击开按钮 ({click_x}, {click_y})")
-        pyautogui.click(click_x, click_y)
+
         time.sleep(3)
 
-        # 拆开后截图：优先截 PayRedEnvelopDetailWindow，否则截聊天区域
         screenshot_url = None
+        detail_win = None
         try:
             desktop = Desktop(backend='uia')
             detail_win = desktop.window(class_name='mmui::PayRedEnvelopDetailWindow',
                                         control_type='Window')
             if detail_win.exists(timeout=3):
                 wr = detail_win.rectangle()
+                log.info(f"[red-packet] detail window rect=({wr.left},{wr.top},{wr.right},{wr.bottom})")
+            elif fallback_rect:
+                wr = fallback_rect
+                log.warning(f"[red-packet] detail window not found; screenshot fallback rect=({wr.left},{wr.top},{wr.right},{wr.bottom})")
             else:
-                wr = r
-            # 截图保存到临时文件（文件名不含 chat，避免昵称含非法字符导致保存失败）
+                wr = chat_list.rectangle()
+                log.warning(f"[red-packet] detail/fallback rect missing; screenshot chat rect=({wr.left},{wr.top},{wr.right},{wr.bottom})")
+
             tmp = _os.path.join(tempfile.gettempdir(), f'hongbao_{int(time.time())}.png')
             ImageGrab.grab(bbox=(wr.left, wr.top, wr.right, wr.bottom)).save(tmp)
-            log.info(f"[微信红包] 截图已保存: {tmp}")
-            # 确保关闭所有红包相关弹窗
+            log.info(f"[red-packet] screenshot saved: {tmp}")
             pyautogui.press('esc')
-            # 上传 MinIO（失败返回 None，让调用方回退到文本转发）
+
             uploader = mqtt_worker._uploader if mqtt_worker._coordinator else None
             if uploader and getattr(uploader, 'available', False):
                 result = uploader.upload(tmp, chat=chat)
                 screenshot_url = result if result else None
                 if screenshot_url:
-                    log.info(f"[微信红包] 截图已上传: {screenshot_url}")
+                    log.info(f"[red-packet] screenshot uploaded: {screenshot_url}")
                 else:
-                    log.warning("[微信红包] 截图上传失败，回退文本转发")
+                    log.warning("[red-packet] screenshot upload failed; fallback to text forwarding")
             else:
-                log.warning("[微信红包] MinIO 未配置，截图未上传")
-            # 清理临时文件
+                log.warning("[red-packet] MinIO not configured; screenshot not uploaded")
+
             try:
                 _os.remove(tmp)
             except OSError:
                 pass
-            if detail_win.exists(timeout=0.5):
+            if detail_win is not None and detail_win.exists(timeout=0.5):
                 try:
                     detail_win.close()
                 except Exception:
                     pass
         except Exception as e:
-            log.warning(f"[微信红包] 截图上传异常: {e}")
+            log.warning(f"[red-packet] screenshot/upload failed: {e}")
 
         time.sleep(0.3)
 
-        # 转发 MQTT：红包拆开 + 截图 URL
         if screenshot_url:
             try:
                 mqtt_worker.on_wechat_message(
-                    chat, chat, "[微信红包已查收]",
-                    msg_type="微信红包",
+                    chat, chat, "[\u5fae\u4fe1\u7ea2\u5305\u5df2\u67e5\u6536]",
+                    msg_type="\u5fae\u4fe1\u7ea2\u5305",
                     file_url=screenshot_url,
                     file_name=f"hongbao_{chat}.png")
-                log.info(f"[微信红包] 截图已转发MQTT: {chat}")
+                log.info(f"[red-packet] screenshot forwarded to MQTT: {chat}")
             except Exception as e:
-                log.warning(f"[微信红包] MQTT转发失败: {e}")
+                log.warning(f"[red-packet] MQTT forwarding failed: {e}")
 
-        log.info(f"[微信红包] 拆开成功: {chat} 截图URL={screenshot_url}")
+        log.info(f"[red-packet] opened: {chat} screenshot_url={screenshot_url}")
         return screenshot_url
     except Exception as e:
-        log.warning(f"[微信红包] 异常: {chat} -> {e}")
+        log.warning(f"[red-packet] exception: {chat} -> {e}")
         try:
             pyautogui.press('esc')
         except Exception:
