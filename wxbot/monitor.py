@@ -1409,11 +1409,15 @@ class Monitor:
         self._last_loop_alert = (msg, now)
         nickname = getattr(mqtt_worker, "_wx_nickname", "") or "未知"
         try:
-            from . import webhook_send
-            webhook_send.send_webhook(
+            from .exception_alert import send_client_exception_alert
+            ok, info = send_client_exception_alert(
                 title=f"【{nickname}】微信机器人异常",
-                content=f"异常: {msg}\n时间: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                exc=e,
+                nickname=nickname,
+                screenshot_reason="monitor_loop_exception",
             )
+            if not ok:
+                log.error(f"主循环异常 webhook 推送失败: {info}")
         except Exception as we:
             log.error(f"主循环异常 webhook 推送失败: {we}")
 

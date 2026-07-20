@@ -54,6 +54,11 @@ def _resolve_bot_id() -> str:
 
 
 def main() -> int:
+    try:
+        from wxbot.exception_alert import install_global_exception_hooks
+        install_global_exception_hooks("main")
+    except Exception:
+        pass
     log.info("=" * 56)
     log.info("wxbot_pyweixin 启动（基于 pyweixin SDK）")
     log.info("=" * 56)
@@ -119,10 +124,13 @@ def main() -> int:
                 if not monitor._stop.is_set():
                     log.error(f"⚠️ 主循环意外退出，5s 后自动恢复: {e}")
                     try:
-                        from wxbot import webhook_send
-                        webhook_send.send_webhook(
+                        from wxbot.exception_alert import send_client_exception_alert
+                        send_client_exception_alert(
                             title=f"【主循环异常自动恢复】{bot_config.get('admin', '')}",
-                            content=f"异常: {e}\n时间: {_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                            exc=e,
+                            nickname=str(bot_config.get('admin', '') or ''),
+                            screenshot_reason="main_loop_exception",
+                        )
                     except Exception:
                         pass
                     _time.sleep(5)

@@ -108,6 +108,9 @@ def _candidate_roots(main_window=None):
 
 def _collect_text(root) -> str:
     parts: list[str] = []
+    root_text = _safe_window_text(root)
+    if root_text:
+        parts.append(root_text)
     for kwargs in ({"control_type": "Text"}, {}):
         try:
             ctrls = root.descendants(**kwargs)
@@ -120,45 +123,145 @@ def _collect_text(root) -> str:
     return " ".join(parts).strip()
 
 
-def _click_confirm(root) -> bool:
-    for title in _CONFIRM_TITLES:
-        try:
-            btn = root.child_window(control_type="Button", title=title)
-            if btn.exists(timeout=0.2):
-                btn.click_input()
-                time.sleep(0.3)
-                return True
-        except Exception:
-            continue
+
+def _is_visible_enabled(ctrl) -> bool:
     try:
-        return dismiss_wx_dialog(root)
+        if hasattr(ctrl, "is_visible") and not ctrl.is_visible():
+            return False
+    except Exception:
+        pass
+    try:
+        if hasattr(ctrl, "is_enabled") and not ctrl.is_enabled():
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def _click_center(ctrl) -> bool:
+    try:
+        if not _is_visible_enabled(ctrl):
+            return False
+        ctrl.click_input()
+        time.sleep(0.3)
+        return True
+    except Exception:
+        pass
+    try:
+        r = ctrl.rectangle()
+        x = int((r.left + r.right) / 2)
+        y = int((r.top + r.bottom) / 2)
+        pyautogui.click(x, y)
+        time.sleep(0.3)
+        return True
     except Exception:
         return False
 
 
-def detect_and_dismiss_wx_dialog(main_window=None, dismiss: bool = True) -> WxDialogResult:
-    """\u8bc6\u522b\u5fae\u4fe1\u63d0\u793a\u5f39\u7a97\u5e76\u6309\u9700\u70b9\u51fb\u786e\u8ba4\uff1b\u5931\u8d25\u5b89\u5168\u8fd4\u56de hit=False\u3002
+def _click_any_confirm_button(root) -> bool:
+    """Try UIA confirm buttons, including nested buttons in mmui dialogs."""
+    # 1) Exact title lookup, including descendant lookup via child_window.
+    for title in _CONFIRM_TITLES:
+        try:
+            btn = root.child_window(control_type="Button", title=title)
+            if btn.exists(timeout=0.2) and _click_center(btn):
+                return True
+        except Exception:
+            continue
 
-    \u5f53\u524d\u91cd\u70b9\u8bc6\u522b\u6dfb\u52a0\u597d\u53cb\u98ce\u63a7\u5f39\u7a97\uff1a"\u64cd\u4f5c\u8fc7\u4e8e\u9891\u7e41\uff0c\u8bf7\u7a0d\u540e\u518d\u8bd5"\u3002
-    UIA \u8bfb\u4e0d\u5230\u6587\u672c\u65f6\uff0c\u4ecd\u4fdd\u7559\u65e7\u7684 OpenCV \u6e05\u7406\u80fd\u529b\uff0c\u4f46\u4e0d\u4f1a\u8bef\u5224\u4e3a\u98ce\u63a7\u3002
+    # 2) Enumerate all descendants; pyweixin/WeChat popups often expose the OK
+    # button as a nested child instead of a direct child of the main window.
+    candidates = []
+    for kwargs in ({"control_type": "Button"}, {}):
+        try:
+            ctrls = list(root.descendants(**kwargs))
+        except Exception:
+            continue
+        for ctrl in ctrls[:120]:
+            try:
+                control_type = getattr(ctrl, "friendly_class_name", lambda: "")()
+            except Exception:
+                control_type = ""
+            title = _safe_window_text(ctrl)
+            is_button_like = ("Button" in str(control_type)) or title in _CONFIRM_TITLES
+            if is_button_like:
+                candidates.append(ctrl)
+
+    # Prefer named confirm buttons, otherwise use the first button-like descendant.
+    candidates.sort(key=lambda c: 0 if _safe_window_text(c) in _CONFIRM_TITLES else 1)
+    for ctrl in candidates[:8]:
+        if _click_center(ctrl):
+            return True
+    return False
+
+
+def _click_rate_limit_fallback(root) -> bool:
+    """Last-resort click for the known one-button rate-limit popup.
+
+    Only used after text has positively matched the rate-limit message, so the
+    coordinate fallback is intentionally conservative and targets the lower
+    center where WeChat places the single OK button.
+    """
+    try:
+        r = root.rectangle()
+        width = max(1, r.right - r.left)
+        height = max(1, r.bottom - r.top)
+        # Dialog button is near lower center; clamp to avoid clicking title bar.
+        x = int(r.left + width * 0.50)
+        y = int(r.top + height * 0.78)
+        pyautogui.click(x, y)
+        time.sleep(0.3)
+        return True
+    except Exception:
+        return False
+
+
+def _click_confirm(root, known_rate_limit: bool = False) -> bool:
+    if _click_any_confirm_button(root):
+        return True
+    try:
+        if dismiss_wx_dialog(root):
+            return True
+    except Exception:
+        pass
+    if known_rate_limit and _click_rate_limit_fallback(root):
+        return True
+    # Esc is safe for modal notice windows and helps when no button is exposed.
+    if known_rate_limit:
+        try:
+            pyautogui.press("esc")
+            time.sleep(0.2)
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def detect_and_dismiss_wx_dialog(main_window=None, dismiss: bool = True) -> WxDialogResult:
+    """Detect and optionally dismiss WeChat notice dialogs safely.
+
+    Focuses on the add-friend rate-limit popup: operation too frequent / retry later.
+    Order: UIA text -> UIA confirm button -> OpenCV template -> known-dialog coordinate fallback.
     """
     fallback_dismissed = False
     for root in _candidate_roots(main_window):
         text = _collect_text(root)
-        if text and all(phrase in text for phrase in _RATE_LIMIT_PHRASES):
-            dismissed = _click_confirm(root) if dismiss else False
-            log.info(f"[\u5f39\u6846\u5904\u7406] \u5fae\u4fe1\u98ce\u63a7\u63d0\u793a: {text[:120]} dismissed={dismissed}")
+        is_rate_limited = bool(text and all(phrase in text for phrase in _RATE_LIMIT_PHRASES))
+        if is_rate_limited:
+            dismissed = _click_confirm(root, known_rate_limit=True) if dismiss else False
+            log.info(f"[wx-dialog] rate-limit notice: {text[:120]} dismissed={dismissed}")
             return WxDialogResult(True, "rate_limited", text, dismissed)
         try:
             if dismiss and not fallback_dismissed:
-                fallback_dismissed = dismiss_wx_dialog(root)
+                # For unknown dialogs, only use exact/non-coordinate methods to
+                # avoid clicking arbitrary WeChat content by mistake.
+                fallback_dismissed = _click_any_confirm_button(root) or dismiss_wx_dialog(root)
         except Exception:
             pass
     if fallback_dismissed:
         return WxDialogResult(True, "unknown", "", True)
     return WxDialogResult(False, "", "", False)
 
-# 弹框确认按钮模板（按优先级尝试）
 _TEMPLATES = ('confirm_btn.png', 'unlock_btn.png')
 # 匹配置信度阈值
 _THRESHOLD = 0.6

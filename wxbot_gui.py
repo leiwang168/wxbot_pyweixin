@@ -579,6 +579,15 @@ class WxBotApp:
                     _monitor.loop()
                 except Exception as e:
                     log.error(f"服务异常: {e}")
+                    try:
+                        from wxbot.exception_alert import send_client_exception_alert
+                        send_client_exception_alert(
+                            title="【GUI服务异常】",
+                            exc=e,
+                            screenshot_reason="gui_service_exception",
+                        )
+                    except Exception:
+                        pass
 
             self._thread = threading.Thread(target=_run, daemon=True)
             self._thread.start()
