@@ -6,11 +6,11 @@ import json
 import threading
 import time
 
-from .common import DEDUP_WINDOW, emit
+from .common import DEFAULT_DEDUP_WINDOW, emit
 
 
 class WorkerIdentity:
-    def __init__(self, cfg: dict, log_func=None) -> None:
+    def __init__(self, cfg: dict, log_func=None, dedup_window: float | None = None) -> None:
         self._log = log_func or emit
         self.enabled = cfg.get("enabled", True)
         self.role = (cfg.get("role") or "").strip()
@@ -23,8 +23,20 @@ class WorkerIdentity:
         fc = cfg.get("forward_contacts", [])
         self.forward_contacts = fc if isinstance(fc, list) else []
 
+        self._dedup_window = self._coerce_dedup_window(dedup_window)
         self._seen_ids: dict[str, float] = {}
         self._lock = threading.Lock()
+
+    @staticmethod
+    def _coerce_dedup_window(value: float | int | str | None) -> float:
+        try:
+            window = float(value if value is not None else DEFAULT_DEDUP_WINDOW)
+        except (TypeError, ValueError):
+            window = float(DEFAULT_DEDUP_WINDOW)
+        return max(1.0, window)
+
+    def _dedup_window_text(self) -> str:
+        return f"{self._dedup_window:g}s"
 
     def resolve_subscribe_topic(self) -> str:
         if self.subscribe_topic and "{role}" in self.subscribe_topic:
@@ -62,11 +74,11 @@ class WorkerIdentity:
             seen_at = self._seen_ids.get(cid)
             if seen_at is not None:
                 age = now - seen_at
-                if age <= DEDUP_WINDOW:
-                    self._log("INFO", f"忽略重复消息 correlationId={cid} age={age:.1f}s window={DEDUP_WINDOW}s", self.role)
+                if age <= self._dedup_window:
+                    self._log("INFO", f"忽略重复消息 correlationId={cid} age={age:.1f}s window={self._dedup_window_text()}", self.role)
                     return True
-                self._log("INFO", f"correlationId 去重已过期，允许重新处理 correlationId={cid} age={age:.1f}s window={DEDUP_WINDOW}s", self.role)
-            cutoff = now - DEDUP_WINDOW
+                self._log("INFO", f"correlationId 去重已过期，允许重新处理 correlationId={cid} age={age:.1f}s window={self._dedup_window_text()}", self.role)
+            cutoff = now - self._dedup_window
             self._seen_ids = {k: v for k, v in self._seen_ids.items() if v > cutoff}
             self._seen_ids[cid] = now
             return False

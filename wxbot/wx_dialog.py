@@ -243,7 +243,6 @@ def detect_and_dismiss_wx_dialog(main_window=None, dismiss: bool = True) -> WxDi
     Focuses on the add-friend rate-limit popup: operation too frequent / retry later.
     Order: UIA text -> UIA confirm button -> OpenCV template -> known-dialog coordinate fallback.
     """
-    fallback_dismissed = False
     for root in _candidate_roots(main_window):
         text = _collect_text(root)
         is_rate_limited = bool(text and all(phrase in text for phrase in _RATE_LIMIT_PHRASES))
@@ -251,15 +250,7 @@ def detect_and_dismiss_wx_dialog(main_window=None, dismiss: bool = True) -> WxDi
             dismissed = _click_confirm(root, known_rate_limit=True) if dismiss else False
             log.info(f"[wx-dialog] rate-limit notice: {text[:120]} dismissed={dismissed}")
             return WxDialogResult(True, "rate_limited", text, dismissed)
-        try:
-            if dismiss and not fallback_dismissed:
-                # For unknown dialogs, only use exact/non-coordinate methods to
-                # avoid clicking arbitrary WeChat content by mistake.
-                fallback_dismissed = _click_any_confirm_button(root) or dismiss_wx_dialog(root)
-        except Exception:
-            pass
-    if fallback_dismissed:
-        return WxDialogResult(True, "unknown", "", True)
+    # 未识别窗口绝不自动点击“确定”；加好友确认窗口本身也包含“确定”按钮。
     return WxDialogResult(False, "", "", False)
 
 _TEMPLATES = ('confirm_btn.png', 'unlock_btn.png')

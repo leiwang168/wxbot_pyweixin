@@ -115,6 +115,50 @@ def _find_and_click_session(session_list, friend, max_pages: int = 10) -> bool:
     return False
 
 
+def _voice_message_delay_seconds() -> float:
+    try:
+        return float(bot_config.get("voice_message_delay", 5) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _refresh_list_item(chat_list, item):
+    """等待后按 runtime_id 重新获取同一条消息，避免读到等待前的 UIA 对象。"""
+    try:
+        rid = item.element_info.runtime_id
+    except Exception:
+        rid = None
+    if not rid:
+        return item
+    try:
+        for candidate in chat_list.children(control_type="ListItem"):
+            try:
+                if candidate.element_info.runtime_id == rid:
+                    return candidate
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return item
+
+
+def classify_message_after_voice_delay(item, chat_list=None) -> tuple[str, str, str | None, object]:
+    """语音消息按配置等待后重新读取同一条消息本身。"""
+    display, mtype, mpath = classify_message(item)
+    if mtype != "语音":
+        return display, mtype, mpath, item
+
+    delay = _voice_message_delay_seconds()
+    if delay <= 0:
+        return display, mtype, mpath, item
+
+    log.info(f"[语音] 等待 {delay}s 后重新读取语音消息")
+    time.sleep(delay)
+    refreshed = _refresh_list_item(chat_list, item) if chat_list is not None else item
+    display, mtype, mpath = classify_message(refreshed)
+    return display, mtype, mpath, refreshed
+
+
 def read_chat_messages(main_window, number: int = 5) -> list[tuple]:
     chat_list = main_window.child_window(**Lists.FriendChatList)
     if not chat_list.exists(timeout=1):
@@ -127,20 +171,7 @@ def read_chat_messages(main_window, number: int = 5) -> list[tuple]:
             i += 1
             continue
         item = items[i]
-        display, mtype, mpath = classify_message(item)
-        # 语音消息：检查下一条是否为转文字内容
-        if mtype == "语音" and i + 1 < len(items):
-            next_display, next_mtype, _ = classify_message(items[i + 1])
-            # 转文字可能尚未完成（下一条还不是文本），等待可配置延迟后重读
-            if next_mtype != "文本" or not next_display:
-                _voice_delay = float(bot_config.get("voice_message_delay", 5) or 0)
-                if _voice_delay > 0:
-                    log.info(f"[语音] 等待 {_voice_delay}s 待转文字完成")
-                    time.sleep(_voice_delay)
-                    next_display, next_mtype, _ = classify_message(items[i + 1])
-            if next_mtype == "文本" and next_display:
-                display = f"{display} | 转文字: {next_display}"
-                i += 1  # 跳过下一条（已合并）
+        display, mtype, mpath, item = classify_message_after_voice_delay(item, chat_list)
         out.append((display, mtype, mpath, item))
         i += 1
     return out
@@ -194,19 +225,38 @@ def _is_system_greeting(text: str) -> bool:
     return any(k in (text or '') for k in kws)
 
 
-def _message_runtime_key(chat: str, msg_type: str, msg_item, scope: str = "MSG") -> str:
-    """Return a UI-element based duplicate key; never falls back to message text."""
-    if msg_item is None:
-        return ""
-    try:
-        runtime_id = getattr(msg_item.element_info, "runtime_id", None)
-    except Exception:
-        runtime_id = None
-    if not runtime_id:
-        return ""
-    if isinstance(runtime_id, (list, tuple)):
-        runtime_id = ".".join(str(x) for x in runtime_id)
-    return f"{chat}:{scope}:{msg_type}:RID:{runtime_id}"
+def _dedupe_log_text(text: str, limit: int = 80) -> str:
+    msg = (text or "").replace("\r", " ").replace("\n", " ")
+    return msg if len(msg) <= limit else msg[:limit] + "..."
+
+
+def _message_content_key(chat: str, sender: str, msg_type: str, text: str,
+                         scope: str = "MSG") -> str:
+    """5秒去重用的内容 key：同一会话/发送人/类型/文本才算相同消息。"""
+    return "\x1f".join((scope or "MSG", chat or "", sender or "",
+                          msg_type or "", text or ""))
+
+
+def _dedupe_recent_message(processed, chat: str, sender: str, msg_type: str,
+                           text: str, scope: str = "MSG") -> bool:
+    """Return True when the same message appeared within the recent window."""
+    key = _message_content_key(chat, sender, msg_type, text, scope=scope)
+    if hasattr(processed, "check_and_add"):
+        duplicated, age = processed.check_and_add(key)
+    else:
+        duplicated = key in processed
+        age = 0.0 if duplicated else None
+        if not duplicated:
+            processed.add(key)
+    if duplicated:
+        age_text = f"{age:.2f}s" if age is not None else "unknown"
+        log.info(
+            f"[\u53bb\u91cd] 5\u79d2\u5185\u76f8\u540c\u6d88\u606f\uff0c\u8df3\u8fc7: "
+            f"{chat}({sender}) [{msg_type}] scope={scope} age={age_text} "
+            f"text={_dedupe_log_text(text)!r}"
+        )
+        return True
+    return False
 
 
 def _uia_text(ctrl) -> str:
@@ -853,11 +903,8 @@ def _process_one(main_window, chat: str, sender: str, text: str,
             log.info(f"[系统消息] 好友通过验证,忽略红点,由 pending 机制统一模拟转发")
         return
     if msg_type in ("被拉黑", "被删除"):
-        alert_id = _message_runtime_key(chat, msg_type, msg_item, scope="ALERT")
-        if alert_id:
-            if alert_id in processed:
-                return
-            processed.add(alert_id)
+        if _dedupe_recent_message(processed, chat, sender, msg_type, text, scope="ALERT"):
+            return
         log.warning(f"⚠️ {chat} 可能{msg_type}: {text!r}")
         kind = "blocked" if msg_type == "被拉黑" else "deleted"
         try:
@@ -876,24 +923,16 @@ def _process_one(main_window, chat: str, sender: str, text: str,
 
     # /指令（仅 admin，不受监听过滤限制）
     if text.startswith("/") and commands.is_admin(sender):
-        cmd_id = _message_runtime_key(chat, "command", msg_item, scope="CMD")
-        if cmd_id:
-            if cmd_id in processed:
-                return
-            processed.add(cmd_id)
+        if _dedupe_recent_message(processed, chat, sender, "command", text, scope="CMD"):
+            return
         reply = commands.handle(text)
         if reply:
             _send_to_chat(main_window, chat, split_long_text(reply), current_friend)
         return
 
-    # Do not dedupe by message content: users may send identical text repeatedly.
-    # Only use WeChat UI runtime_id to skip the same UI item across polling rounds.
-    # If runtime_id is unavailable, let it pass; never fall back to text/content.
-    msg_id = _message_runtime_key(chat, msg_type, msg_item)
-    if msg_id:
-        if msg_id in processed:
-            return
-        processed.add(msg_id)
+    # 按用户要求：仅 5 秒内同一会话/发送人/类型/文本完全相同才去重。
+    if _dedupe_recent_message(processed, chat, sender, msg_type, text):
+        return
 
 
     log.info(f"[收到] {chat}({sender}) [{msg_type}]: {text!r}")
@@ -988,12 +1027,8 @@ def _group_monitor_forward(main_window, chat: str, sender: str, text: str,
     targets = match_group_monitor(chat, text)
     if not targets:
         return False
-    # Group monitor also avoids content-based dedupe for repeated keyword messages.
-    gmon_id = _message_runtime_key(chat, "group_monitor", msg_item, scope="GMON")
-    if gmon_id:
-        if gmon_id in processed:
-            return False
-        processed.add(gmon_id)
+    if _dedupe_recent_message(processed, chat, sender, "group_monitor", text, scope="GMON"):
+        return False
     sender_real = ""
     try:
         sender_real = read_group_sender(msg_item)
@@ -1069,21 +1104,44 @@ def _open_weixin_safe(retries: int = 3, interval: float = 2.0):
 
 
 class _BoundedSet:
-    """大小受限的去重集合，基于 OrderedDict 实现 LRU 淘汰。"""
-    def __init__(self, maxsize: int = 5000) -> None:
-        self._data: OrderedDict[str, None] = OrderedDict()
+    """5秒窗口消息去重表，基于 OrderedDict 维护最近消息。"""
+    def __init__(self, maxsize: int = 5000, window_seconds: float = 5.0) -> None:
+        self._data: OrderedDict[str, float] = OrderedDict()
         self._maxsize = maxsize
+        self._window_seconds = float(window_seconds)
+
+    def _prune(self, now: float) -> None:
+        expire_before = now - self._window_seconds
+        while self._data:
+            _, ts = next(iter(self._data.items()))
+            if ts >= expire_before:
+                break
+            self._data.popitem(last=False)
 
     def __contains__(self, key: str) -> bool:
         return key in self._data
 
     def add(self, key: str) -> None:
+        now = time.monotonic()
+        self._prune(now)
+        self._data[key] = now
+        self._data.move_to_end(key)
+        while len(self._data) > self._maxsize:
+            self._data.popitem(last=False)
+
+    def check_and_add(self, key: str) -> tuple[bool, float | None]:
+        now = time.monotonic()
+        self._prune(now)
         if key in self._data:
-            self._data.move_to_end(key)  # 刷新为最近使用
-        else:
-            self._data[key] = None
-            if len(self._data) > self._maxsize:
-                self._data.popitem(last=False)  # 淘汰最早的
+            age = now - self._data[key]
+            self._data[key] = now
+            self._data.move_to_end(key)
+            return True, age
+        self._data[key] = now
+        self._data.move_to_end(key)
+        while len(self._data) > self._maxsize:
+            self._data.popitem(last=False)
+        return False, None
 
 
 class Monitor:
@@ -1214,7 +1272,7 @@ class Monitor:
                             self.current_last_rid = None
                         else:
                             for item in new_items:
-                                msg_text, msg_type, file_path = classify_message(item)
+                                msg_text, msg_type, file_path, item = classify_message_after_voice_delay(item, chat_list)
                                 _process_one(main_window, self.current_friend,
                                              self.current_friend, msg_text, msg_type,
                                              self.current_friend, self.processed, file_path=file_path,

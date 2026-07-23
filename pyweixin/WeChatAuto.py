@@ -1523,6 +1523,24 @@ class Contacts():
         return newfriends_detail
 
 
+def _replace_and_verify_edit_text(edit_spec:WindowSpecification,value:str,field_name:str)->None:
+    """Replace a WeChat edit through real keyboard input, then verify before submit."""
+    edit=edit_spec.wrapper_object()
+    edit.click_input()
+    edit.set_focus()
+    pyautogui.hotkey('ctrl','a',_pause=False)
+    pyautogui.press('backspace',_pause=False)
+    SystemSettings.copy_text_to_clipboard(value)
+    pyautogui.hotkey('ctrl','v',_pause=False)
+    time.sleep(0.2)
+    actual=edit.get_value()
+    if actual!=value:
+        actual_len=len(actual) if isinstance(actual,str) else -1
+        raise RuntimeError(
+            f'{field_name} input mismatch: expected_len={len(value)}, actual_len={actual_len}'
+        )
+
+
 class FriendSettings():
     '''关于好友设置的一些方法'''
     
@@ -1546,46 +1564,58 @@ class FriendSettings():
         if close_weixin is None:
             close_weixin=GlobalConfig.close_weixin
         add_friend_pane,main_window=Navigator.open_add_friend_panel(is_maximize=is_maximize)
-        search_edit=add_friend_pane.child_window(control_type='Edit')
-        search_edit.set_text('')
-        search_edit.type_keys(number,with_spaces=True)
-        search_edit.type_keys('{ENTER}')
-        time.sleep(1.0)#等待搜索结果加载,避免UI未就绪误判"搜不到"
-        contact_profile_view=add_friend_pane.child_window(**Groups.ContactProfileViewGroup)
-        if not contact_profile_view.exists(timeout=4):
-            #搜不到该号码对应的用户(号码不存在或输错),不会发出申请
-            add_friend_pane.close()
-            if close_weixin:main_window.close()
-            raise NoSuchFriendError(f'未搜索到 {number} 对应的用户,请检查号码是否正确')
-        add_to_contact=contact_profile_view.child_window(**Buttons.AddToContactsButton)
-        if not add_to_contact.exists(timeout=4):
-            #资料页存在但无"添加到通讯录"按钮,通常是对方已是好友
-            add_friend_pane.close()
-            if close_weixin:main_window.close()
-            raise ValueError(f'{number} 已经是你的好友,无需重复添加')
-        # 抓取对方昵称（contact_profile_view 第一个 Text 控件）
-        texts=contact_profile_view.descendants(control_type='Text')
-        nickname=texts[0].window_text() if texts else number
-        add_to_contact.click_input()
-        time.sleep(0.8)#等待点击"添加到通讯录"后验证朋友弹窗弹出并稳定
-        verify_friend_window=Tools.move_window_to_center(Window=Windows.VerifyFriendWindow)
-        request_content_edit=verify_friend_window.child_window(control_type='Edit',found_index=0)
-        remark_edit=verify_friend_window.child_window(control_type='Edit',found_index=1)
-        chat_only_group=verify_friend_window.child_window(**Groups.ChatOnlyGroup)
-        confirm_button=verify_friend_window.child_window(**Buttons.ConfirmButton)
-        if greetings is not None:
-            request_content_edit.set_text(greetings)
-        if remark is not None:
-            remark_edit.set_text(remark)
-        if chat_only:
-            chat_only_group.click_input()
-        time.sleep(0.3)#填写完毕后短暂稳定再点确认,避免按钮未就绪
-        confirm_button.click_input()
-        time.sleep(0.6)#等待好友申请发出,过早关闭可能导致请求丢失
-        add_friend_pane.close()
-        if close_weixin:
-            main_window.close()
-        return nickname
+        verify_friend_window=None
+        try:
+            search_edit=add_friend_pane.child_window(control_type='Edit')
+            search_edit.set_text('')
+            search_edit.type_keys(number,with_spaces=True)
+            search_edit.type_keys('{ENTER}')
+            time.sleep(1.0)#等待搜索结果加载,避免UI未就绪误判"搜不到"
+            contact_profile_view=add_friend_pane.child_window(**Groups.ContactProfileViewGroup)
+            if not contact_profile_view.exists(timeout=4):
+                #搜不到该号码对应的用户(号码不存在或输错),不会发出申请
+                raise NoSuchFriendError(f'未搜索到 {number} 对应的用户,请检查号码是否正确')
+            add_to_contact=contact_profile_view.child_window(**Buttons.AddToContactsButton)
+            if not add_to_contact.exists(timeout=4):
+                #资料页存在但无"添加到通讯录"按钮,通常是对方已是好友
+                raise ValueError(f'{number} 已经是你的好友,无需重复添加')
+            # 抓取对方昵称（contact_profile_view 第一个 Text 控件）
+            texts=contact_profile_view.descendants(control_type='Text')
+            nickname=texts[0].window_text() if texts else number
+            add_to_contact.click_input()
+            time.sleep(0.8)#等待点击"添加到通讯录"后验证朋友弹窗弹出并稳定
+            verify_friend_window=Tools.move_window_to_center(Window=Windows.VerifyFriendWindow)
+            # 当前微信版本的 Edit 控件不暴露可匹配标题，使用窗口内实际顺序定位。
+            request_content_edit=verify_friend_window.child_window(control_type='Edit',found_index=0)
+            remark_edit=verify_friend_window.child_window(control_type='Edit',found_index=1)
+            chat_only_group=verify_friend_window.child_window(**Groups.ChatOnlyGroup)
+            confirm_button=verify_friend_window.child_window(**Buttons.ConfirmButton)
+            if greetings is not None:
+                _replace_and_verify_edit_text(request_content_edit,greetings,'friend request reason')
+            if remark is not None:
+                _replace_and_verify_edit_text(remark_edit,remark,'friend remark')
+            if chat_only:
+                chat_only_group.click_input()
+            time.sleep(3.0)#申请理由和备注都写入并校验后等待3秒再确认
+            confirm_button.click_input()
+            time.sleep(0.6)#等待好友申请发出,过早关闭可能导致请求丢失
+            return nickname
+        finally:
+            # 成功、输入校验失败或其他异常都清理两个窗口，避免残留窗口被后续任务误操作。
+            if verify_friend_window is not None:
+                try:
+                    verify_friend_window.close()
+                except Exception:
+                    pass
+            try:
+                add_friend_pane.close()
+            except Exception:
+                pass
+            if close_weixin:
+                try:
+                    main_window.close()
+                except Exception:
+                    pass
 
     @staticmethod
     def mute_notification(friend:str,mute:int=0,fold_chat:int=0,search_pages:int=None,is_maximize:bool=None,close_weixin:bool=None):

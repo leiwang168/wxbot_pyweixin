@@ -435,12 +435,8 @@ class TaskExecutor:
                         reason = dialog.text or str(e) or "操作过于频繁，请稍后再试"
                         retry_after = self._mark_add_friend_rate_limited(reason)
                         return self._add_friend_rate_limited_result(reason, target, retry_after)
-                    # 兼容旧逻辑：未知弹窗仍尝试 OpenCV 清理，保证下个任务/monitor 页面干净。
-                    self._log("WARNING", f"添加好友异常(疑似弹框)，已尝试清理弹窗: {e}")
-                    try:
-                        dismiss_wx_dialog(Navigator.open_weixin(is_maximize=False))
-                    except Exception as de:
-                        self._log("WARNING", f"清理弹窗失败: {de}")
+                    # 未知异常不得自动点击确认；FriendSettings 会在 finally 中关闭加好友窗口。
+                    self._log("WARNING", f"添加好友异常，已停止提交并清理加好友窗口: {e}")
                     raise
             finally:
                 self._exit_ui()

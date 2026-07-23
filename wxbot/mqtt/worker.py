@@ -23,7 +23,7 @@ from pyweixin.Uielements import Windows
 from ..config import bot_config
 from ..input_blocker import input_blocker
 from .adapter import MqttAdapter
-from .common import DEDUP_WINDOW, MinioUploader, emit
+from .common import DEFAULT_DEDUP_WINDOW, MinioUploader, emit
 from .coordinator import MqttCoordinator
 from .executor import TaskExecutor
 from .identity import WorkerIdentity
@@ -277,6 +277,18 @@ class MqttWorkerExtension:
             self._process_lock = None
             emit("INFO", f"MQTT process lock released: [{label}] pid={os.getpid()}")
 
+    @staticmethod
+    def _correlation_dedup_window(cfg: dict) -> float:
+        try:
+            window = float((cfg or {}).get("correlation_dedup_window", DEFAULT_DEDUP_WINDOW) or DEFAULT_DEDUP_WINDOW)
+        except (TypeError, ValueError):
+            window = float(DEFAULT_DEDUP_WINDOW)
+        return max(1.0, window)
+
+    @staticmethod
+    def _seconds_text(seconds: float) -> str:
+        return f"{seconds:g}s"
+
     # ---- 生命周期 ----
     def initialize(self) -> None:
         if self._coordinator:
@@ -312,10 +324,11 @@ class MqttWorkerExtension:
             self._initialized = True
             return
 
-        self._identities = [WorkerIdentity(w) for w in workers_cfg]
+        dedup_window = self._correlation_dedup_window(cfg)
+        self._identities = [WorkerIdentity(w, dedup_window=dedup_window) for w in workers_cfg]
         emit("INFO", f"初始化 MQTT 数字员工 共 {len(self._identities)} 个身份，"
               f"启用 {sum(1 for i in self._identities if i.enabled)} 个")
-        emit("INFO", f"correlationId 去重窗口={DEDUP_WINDOW}s（同 id 在窗口内忽略，过期后可重新处理）")
+        emit("INFO", f"correlationId 去重窗口={self._seconds_text(dedup_window)}（同 id 在窗口内忽略，过期后可重新处理）")
         self._validate_multi_identity()
 
         first = next((i for i in self._identities if i.enabled),
@@ -458,8 +471,9 @@ class MqttWorkerExtension:
             self._initialized = True
             return
 
-        self._identities = [WorkerIdentity(w) for w in workers_cfg]
-        emit("INFO", f"correlationId 去重窗口={DEDUP_WINDOW}s（同 id 在窗口内忽略，过期后可重新处理）")
+        dedup_window = self._correlation_dedup_window(cfg)
+        self._identities = [WorkerIdentity(w, dedup_window=dedup_window) for w in workers_cfg]
+        emit("INFO", f"correlationId 去重窗口={self._seconds_text(dedup_window)}（同 id 在窗口内忽略，过期后可重新处理）")
         first = next((i for i in self._identities if i.enabled),
                      self._identities[0] if self._identities else None)
         agent_base = first.agent_id if first else "wbot"
@@ -926,7 +940,7 @@ class MqttWorkerExtension:
                 emit("INFO", f"补发媒体消息 -> {publish_topic} file={file_name}", ident.role)
 
     def _save_latest_media(self, chat: str, msg_type: str) -> tuple[str, int, str] | None:
-        """右键图片消息（left+40 偏移点缩略图）→ 复制 → 剪贴板落地 → 上传 MinIO。"""
+        """右键图片消息（靠左偏移点缩略图）→ 复制 → 剪贴板落地 → 上传 MinIO。"""
         import tempfile
         import pyautogui
         from pyweixin.WeChatTools import Navigator, mouse
@@ -948,8 +962,9 @@ class MqttWorkerExtension:
                 return None
             last = items[-1]
             r = last.rectangle()
-            # 右键坐标偏移到组件最左侧+200（点中图片缩略图，避免小图片点空）
-            mouse.right_click(coords=(r.left + 200, (r.top + r.bottom) // 2))
+            # 右键坐标从原 left+200 向左偏移 1/2，窄图缩略图更容易被选中。
+            media_click_x = r.left + 100
+            mouse.right_click(coords=(media_click_x, (r.top + r.bottom) // 2))
             time.sleep(0.5)
             copy_item = mw.child_window(**MenuItems.CopyMenuItem)
             copied = False

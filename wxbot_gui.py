@@ -270,6 +270,8 @@ class WxBotApp:
         ttk.Entry(lf, textvariable=vv, width=24).grid(row=r, column=1, sticky=tk.W, padx=4); r += 1
         vt = tk.BooleanVar(value=bool(broker.get("tls", False))); self._bool_vars["mqtt_tls"] = vt
         ttk.Checkbutton(lf, text="TLS", variable=vt).grid(row=r, column=0, sticky=tk.W, pady=1); r += 1
+        r = self._kv_entry(lf, "mqtt_correlation_dedup_window", "MQTT消息去重（秒）:", r,
+                           m.get("correlation_dedup_window", 10), width=8)
 
         lf2 = self._lf(p, "MinIO 对象存储"); r = 0
         minio = m.get("minio", {}) or {}
@@ -475,6 +477,10 @@ class WxBotApp:
             broker["password"] = self._str_vars["mqtt_pass"].get()
             broker["vhost"] = self._str_vars["mqtt_vhost"].get() or "/"
             broker["tls"] = self._bool_vars["mqtt_tls"].get()
+            try:
+                mqtt["correlation_dedup_window"] = max(1, int(self._str_vars["mqtt_correlation_dedup_window"].get()))
+            except (KeyError, ValueError):
+                mqtt["correlation_dedup_window"] = 10
             # MinIO（每个字段独立）
             mqtt["minio"] = {
                 "endpoint": self._str_vars["minio_endpoint"].get(),
