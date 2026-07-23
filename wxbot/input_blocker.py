@@ -209,7 +209,8 @@ class InputBlocker:
 
     def set_bot_active(self, b: bool):
         """机器人持 UI 锁操作期间置 True，放行其点击。"""
-        self._bot_active = bool(b)
+        with self._lock:
+            self._bot_active = bool(b)
 
     def enable(self, reason="") -> str:
         with self._lock:

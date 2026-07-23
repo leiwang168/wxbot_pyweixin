@@ -54,6 +54,11 @@ def _resolve_bot_id() -> str:
 
 
 def main() -> int:
+    try:
+        from wxbot.exception_alert import install_global_exception_hooks
+        install_global_exception_hooks("main")
+    except Exception:
+        pass
     log.info("=" * 56)
     log.info("wxbot_pyweixin 启动（基于 pyweixin SDK）")
     log.info("=" * 56)
@@ -107,16 +112,34 @@ def main() -> int:
     # 启动调度器（定时消息/朋友圈/新好友/点赞，后台线程）
     scheduler.start()
 
-    # 主循环（消息收发）在前台运行
+    # 主循环（消息收发）在前台运行——意外异常自动恢复，仅 Ctrl+C / 正常停止退出
+    import time as _time
     try:
-        monitor.loop()
-    except KeyboardInterrupt:
-        log.info("收到 Ctrl+C，正在停止...")
+        while True:
+            try:
+                monitor.loop()
+            except Exception as e:
+                # monitor.loop 内部已兜底单轮异常；此分支为防御性双保险，
+                # 确保 _in_pause_period 等非单轮异常也不致整程序退出
+                if not monitor._stop.is_set():
+                    log.error(f"⚠️ 主循环意外退出，5s 后自动恢复: {e}")
+                    try:
+                        from wxbot.exception_alert import send_client_exception_alert
+                        send_client_exception_alert(
+                            title=f"【主循环异常自动恢复】{bot_config.get('admin', '')}",
+                            exc=e,
+                            nickname=str(bot_config.get('admin', '') or ''),
+                            screenshot_reason="main_loop_exception",
+                        )
+                    except Exception:
+                        pass
+                    _time.sleep(5)
+                    continue
+            break
     finally:
         monitor.stop()
         scheduler.stop()
-        if mqtt_worker._coordinator:
-            mqtt_worker._coordinator.shutdown()
+        mqtt_worker.shutdown()
         log.info("已退出")
     return 0
 

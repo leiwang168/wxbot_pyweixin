@@ -431,6 +431,32 @@ def classify_message(item):
     return text, '未知', None
 
 
+def detect_block_or_delete(main_window,max_recent=3):
+    '''发消息后检测对方是否删除/拉黑了自己。返回 None(正常)/'deleted'(被删)/'blocked'(被拉黑)。
+    复用 BLACK_HINTS/DELETE_HINTS + FriendChatList 容器遍历 + VerifyFriendWindow 弹窗。全程不抛,失败返回 None(保守不误报)。'''
+    from .Uielements import Lists#聊天界面消息列表容器
+    #1)被删:朋友验证弹窗(class_name 复用 Uielements.VerifyFriendWindow)
+    try:
+        if main_window.child_window(class_name='mmui::VerifyFriendWindow').exists(timeout=0.3):
+            return 'deleted'
+    except Exception:
+        pass
+    #2)被拉黑/被删兜底:聊天流最新消息匹配(与 monitor read_chat_messages 同款遍历)
+    try:
+        chat_list=main_window.child_window(**Lists.FriendChatList)
+        if chat_list.exists(timeout=0.5):
+            items=chat_list.children(control_type="ListItem")
+            for item in items[-max_recent:]:
+                text=item.window_text() or ''
+                if any(k in text for k in BLACK_HINTS):
+                    return 'blocked'
+                if any(k in text for k in DELETE_HINTS):
+                    return 'deleted'
+    except Exception:
+        pass
+    return None
+
+
 def NativeChooseFolder(folder:str):
     '''
     该函数用来在windows选择文件夹界面中选择文件夹(微信点击保存按钮后弹出),Win10,Win11通用

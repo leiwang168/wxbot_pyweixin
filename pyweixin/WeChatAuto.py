@@ -1523,6 +1523,24 @@ class Contacts():
         return newfriends_detail
 
 
+def _replace_and_verify_edit_text(edit_spec:WindowSpecification,value:str,field_name:str)->None:
+    """Replace a WeChat edit through real keyboard input, then verify before submit."""
+    edit=edit_spec.wrapper_object()
+    edit.click_input()
+    edit.set_focus()
+    pyautogui.hotkey('ctrl','a',_pause=False)
+    pyautogui.press('backspace',_pause=False)
+    SystemSettings.copy_text_to_clipboard(value)
+    pyautogui.hotkey('ctrl','v',_pause=False)
+    time.sleep(0.2)
+    actual=edit.get_value()
+    if actual!=value:
+        actual_len=len(actual) if isinstance(actual,str) else -1
+        raise RuntimeError(
+            f'{field_name} input mismatch: expected_len={len(value)}, actual_len={actual_len}'
+        )
+
+
 class FriendSettings():
     '''关于好友设置的一些方法'''
     
@@ -1546,42 +1564,58 @@ class FriendSettings():
         if close_weixin is None:
             close_weixin=GlobalConfig.close_weixin
         add_friend_pane,main_window=Navigator.open_add_friend_panel(is_maximize=is_maximize)
-        search_edit=add_friend_pane.child_window(control_type='Edit')
-        search_edit.set_text('')
-        search_edit.type_keys(number,with_spaces=True)
-        search_edit.type_keys('{ENTER}')
-        contact_profile_view=add_friend_pane.child_window(**Groups.ContactProfileViewGroup)
-        if not contact_profile_view.exists(timeout=2):
-            #搜不到该号码对应的用户(号码不存在或输错),不会发出申请
-            add_friend_pane.close()
-            if close_weixin:main_window.close()
-            raise NoSuchFriendError(f'未搜索到 {number} 对应的用户,请检查号码是否正确')
-        add_to_contact=contact_profile_view.child_window(**Buttons.AddToContactsButton)
-        if not add_to_contact.exists(timeout=2):
-            #资料页存在但无"添加到通讯录"按钮,通常是对方已是好友
-            add_friend_pane.close()
-            if close_weixin:main_window.close()
-            raise ValueError(f'{number} 已经是你的好友,无需重复添加')
-        # 抓取对方昵称（contact_profile_view 第一个 Text 控件）
-        texts=contact_profile_view.descendants(control_type='Text')
-        nickname=texts[0].window_text() if texts else number
-        add_to_contact.click_input()
-        verify_friend_window=Tools.move_window_to_center(Window=Windows.VerifyFriendWindow)
-        request_content_edit=verify_friend_window.child_window(control_type='Edit',found_index=0)
-        remark_edit=verify_friend_window.child_window(control_type='Edit',found_index=1)
-        chat_only_group=verify_friend_window.child_window(**Groups.ChatOnlyGroup)
-        confirm_button=verify_friend_window.child_window(**Buttons.ConfirmButton)
-        if greetings is not None:
-            request_content_edit.set_text(greetings)
-        if remark is not None:
-            remark_edit.set_text(remark)
-        if chat_only:
-            chat_only_group.click_input()
-        confirm_button.click_input()
-        add_friend_pane.close()
-        if close_weixin:
-            main_window.close()
-        return nickname
+        verify_friend_window=None
+        try:
+            search_edit=add_friend_pane.child_window(control_type='Edit')
+            search_edit.set_text('')
+            search_edit.type_keys(number,with_spaces=True)
+            search_edit.type_keys('{ENTER}')
+            time.sleep(1.0)#等待搜索结果加载,避免UI未就绪误判"搜不到"
+            contact_profile_view=add_friend_pane.child_window(**Groups.ContactProfileViewGroup)
+            if not contact_profile_view.exists(timeout=4):
+                #搜不到该号码对应的用户(号码不存在或输错),不会发出申请
+                raise NoSuchFriendError(f'未搜索到 {number} 对应的用户,请检查号码是否正确')
+            add_to_contact=contact_profile_view.child_window(**Buttons.AddToContactsButton)
+            if not add_to_contact.exists(timeout=4):
+                #资料页存在但无"添加到通讯录"按钮,通常是对方已是好友
+                raise ValueError(f'{number} 已经是你的好友,无需重复添加')
+            # 抓取对方昵称（contact_profile_view 第一个 Text 控件）
+            texts=contact_profile_view.descendants(control_type='Text')
+            nickname=texts[0].window_text() if texts else number
+            add_to_contact.click_input()
+            time.sleep(0.8)#等待点击"添加到通讯录"后验证朋友弹窗弹出并稳定
+            verify_friend_window=Tools.move_window_to_center(Window=Windows.VerifyFriendWindow)
+            # 当前微信版本的 Edit 控件不暴露可匹配标题，使用窗口内实际顺序定位。
+            request_content_edit=verify_friend_window.child_window(control_type='Edit',found_index=0)
+            remark_edit=verify_friend_window.child_window(control_type='Edit',found_index=1)
+            chat_only_group=verify_friend_window.child_window(**Groups.ChatOnlyGroup)
+            confirm_button=verify_friend_window.child_window(**Buttons.ConfirmButton)
+            if greetings is not None:
+                _replace_and_verify_edit_text(request_content_edit,greetings,'friend request reason')
+            if remark is not None:
+                _replace_and_verify_edit_text(remark_edit,remark,'friend remark')
+            if chat_only:
+                chat_only_group.click_input()
+            time.sleep(3.0)#申请理由和备注都写入并校验后等待3秒再确认
+            confirm_button.click_input()
+            time.sleep(0.6)#等待好友申请发出,过早关闭可能导致请求丢失
+            return nickname
+        finally:
+            # 成功、输入校验失败或其他异常都清理两个窗口，避免残留窗口被后续任务误操作。
+            if verify_friend_window is not None:
+                try:
+                    verify_friend_window.close()
+                except Exception:
+                    pass
+            try:
+                add_friend_pane.close()
+            except Exception:
+                pass
+            if close_weixin:
+                try:
+                    main_window.close()
+                except Exception:
+                    pass
 
     @staticmethod
     def mute_notification(friend:str,mute:int=0,fold_chat:int=0,search_pages:int=None,is_maximize:bool=None,close_weixin:bool=None):
@@ -1997,19 +2031,31 @@ class Files():
                     SystemSettings.copy_text_to_clipboard(message)
                     pyautogui.hotkey('ctrl','v',_pause=False)
                     time.sleep(send_delay)
+                    try:
+                        edit_area.set_focus()#Alt+S 前确保焦点在输入框,避免焦点丢失导致发送无效
+                    except Exception:
+                        pass
                     pyautogui.hotkey('alt','s',_pause=False)
                 if len(message)>2000:
                     SystemSettings.convert_long_text_to_txt(message)
                     pyautogui.hotkey('ctrl','v',_pause=False)
                     time.sleep(send_delay)
+                    try:
+                        edit_area.set_focus()
+                    except Exception:
+                        pass
                     pyautogui.hotkey('alt','s',_pause=False)
-                    warn(message=f"微信消息字数上限为2000,超过2000字部分将被省略,该条长文本消息已为你转换为txt发送",category=LongTextWarning) 
+                    warn(message=f"微信消息字数上限为2000,超过2000字部分将被省略,该条长文本消息已为你转换为txt发送",category=LongTextWarning)
         #发送文件逻辑
         def send_files(files):
             if len(files)<=9:
                 SystemSettings.copy_files_to_clipboard(filepaths_list=files)
                 pyautogui.hotkey("ctrl","v")
                 time.sleep(send_delay)
+                try:
+                    edit_area.set_focus()#Alt+S 前确保焦点在输入框
+                except Exception:
+                    pass
                 pyautogui.hotkey('alt','s',_pause=False)
             else:
                 files_num=len(files)
@@ -2019,11 +2065,19 @@ class Files():
                         SystemSettings.copy_files_to_clipboard(filepaths_list=files[i:i+9])
                         pyautogui.hotkey('ctrl','v')
                         time.sleep(send_delay)
+                        try:
+                            edit_area.set_focus()
+                        except Exception:
+                            pass
                         pyautogui.hotkey('alt','s',_pause=False)
                 if rem:
                     SystemSettings.copy_files_to_clipboard(filepaths_list=files[files_num-rem:files_num])
                     pyautogui.hotkey('ctrl','v')
                     time.sleep(send_delay)
+                    try:
+                        edit_area.set_focus()
+                    except Exception:
+                        pass
                     pyautogui.hotkey('alt','s',_pause=False)
         if is_maximize is None:
             is_maximize=GlobalConfig.is_maximize
@@ -2497,21 +2551,28 @@ class Moments():
             if not paths:raise ValueError(f'medias列表内无可用图片或视频路径!')
         moments=Navigator.open_moments(is_maximize=is_maximize,close_weixin=close_weixin)
         moments.child_window(**Buttons.PostButton).right_click_input(),
+        time.sleep(0.6)#等待右键菜单弹出
         pyautogui.press('up',presses=2)
+        time.sleep(0.3)#让菜单选项高亮稳定
         if medias:
             pyautogui.press('enter')
+            time.sleep(0.5)#等待原生文件选择窗口弹出
             native_window=desktop.window(**Windows.NativeChooseFileWindow)
             edit=native_window.child_window(**Edits.NativeFileSaveEdit)
             edit.set_text(paths)
+            time.sleep(0.3)#路径填入后短暂稳定再确认
             pyautogui.hotkey('alt','o')
+            time.sleep(0.8)#等待回到发布面板且媒体缩略图加载
         if text and not medias:
             pyautogui.press('down',presses=1)
             pyautogui.press('enter')
+            time.sleep(0.5)#等待纯文字发布面板弹出
         publish_panel=moments.child_window(**Groups.SnsPublishGroup)
         if text:
             text_input=publish_panel.child_window(**Edits.SnsEdit)
             text_input.click_input()
             text_input.set_text(text)
+            time.sleep(0.4)#文本填入后短暂稳定再发布
         post_button=publish_panel.child_window(**Buttons.PostButton)
         post_button.click_input()
         # 等微信服务器处理 + 弹出"已发送"提示消失后再关闭
@@ -3308,17 +3369,56 @@ class Messages():
             At_all(main_window)
         if at_members:
             At(main_window,at_members)
+        _MAX_SEND_RETRIES=2#最多重试2次,合计3次尝试
         for message in messages:
             if 0<len(message)<2000:
-                edit_area.click_input()
-                SystemSettings.copy_text_to_clipboard(message)#不要直接set_text,直接set_text相当于默认clear了
-                pyautogui.hotkey('ctrl','v',_pause=False)
-                time.sleep(send_delay)
-                pyautogui.hotkey('alt','s',_pause=False)
+                _sent_ok=False
+                for _attempt in range(1+_MAX_SEND_RETRIES):
+                    edit_area.click_input()
+                    SystemSettings.copy_text_to_clipboard(message)#不要直接set_text,直接set_text相当于默认clear了
+                    pyautogui.hotkey('ctrl','v',_pause=False)
+                    time.sleep(send_delay)
+                    #核心修复:Alt+S 前强制焦点回到输入框,避免焦点丢失导致发送无效
+                    try:
+                        edit_area.set_focus()
+                    except Exception:
+                        pass
+                    pyautogui.hotkey('alt','s',_pause=False)
+                    time.sleep(0.3)#等微信处理发送并清空输入框
+                    #校验:发送成功后输入框应清空。仅当明确读到仍是原文才判定失败重试,
+                    #读不到/为空/不一致一律保守视为成功,避免误重试导致重复发送
+                    try:
+                        _remaining=edit_area.window_text()
+                    except Exception:
+                        _remaining=None
+                    if _remaining is None:
+                        _sent_ok=True
+                        break
+                    _remaining=_remaining.strip() if isinstance(_remaining,str) else ''
+                    if not _remaining:
+                        _sent_ok=True
+                        break
+                    if _remaining==message.strip():
+                        if _attempt<_MAX_SEND_RETRIES:
+                            try:
+                                edit_area.set_text('')#清空残留,为重试做准备
+                            except Exception:
+                                pass
+                            continue
+                        raise RuntimeError(f"消息发送失败:{1+_MAX_SEND_RETRIES}次尝试后输入框内容仍未发出。前50字: {message[:50]}")
+                    _sent_ok=True
+                    break
+                if not _sent_ok:
+                    raise RuntimeError(f"消息发送失败:未知原因。前50字: {message[:50]}")
             elif len(message)>2000:#字数超过200字发送txt文件
                 SystemSettings.convert_long_text_to_txt(message)
                 pyautogui.hotkey('ctrl','v',_pause=False)
                 time.sleep(send_delay)
+                #长文本同样修焦点
+                try:
+                    edit_area.set_focus()
+                except Exception:
+                    pass
                 pyautogui.hotkey('alt','s',_pause=False)
                 warn(message=f"微信消息字数上限为2000,超过2000字部分将被省略,该条长文本消息已为你转换为txt发送",category=LongTextWarning)
         if close_weixin:

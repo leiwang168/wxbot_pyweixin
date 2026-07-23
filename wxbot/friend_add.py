@@ -17,6 +17,9 @@ import time
 
 from .config import bot_config
 from .mqtt.resolver import ContactResolver
+from .wx_dialog import (detect_and_dismiss_wx_dialog,
+                        get_add_friend_rate_limit_retry_after,
+                        mark_add_friend_rate_limited)
 
 
 def _emit(msg: str) -> None:
@@ -44,9 +47,19 @@ class _FriendAddAdapter:
                 kwargs["remark"] = remark
             _emit(f"Adapter: 准备调用 FriendSettings.add_new_friend(number={target})")
             nickname = FriendSettings.add_new_friend(**kwargs)
+            dialog = detect_and_dismiss_wx_dialog()
+            if dialog.dialog_type == "rate_limited":
+                reason = dialog.text or "操作过于频繁，请稍后再试"
+                _emit(f"Adapter: 检测到微信风控弹窗: {reason[:120]}")
+                return {"status": "rate_limited", "raw": reason}
             _emit(f"Adapter: add_new_friend 返回成功, 昵称={nickname}")
             return {"status": "sent", "raw": None, "nickname": nickname}
         except Exception as e:
+            dialog = detect_and_dismiss_wx_dialog()
+            if dialog.dialog_type == "rate_limited":
+                reason = dialog.text or str(e) or "操作过于频繁，请稍后再试"
+                _emit(f"Adapter: 异常后检测到微信风控弹窗: {reason[:120]}")
+                return {"status": "rate_limited", "raw": reason}
             _emit(f"Adapter: add_new_friend 异常: {type(e).__name__}: {e}")
             return {"status": "failed", "raw": str(e)}
 
@@ -66,6 +79,37 @@ class _FriendAddService:
         self._today_date: str | None = None
         _emit(f"Service 初始化: cfg={config}")
 
+    def _cooldown_seconds(self) -> int:
+        try:
+            seconds = int(self._cfg.get("rate_limit_cooldown_seconds", 3600) or 3600)
+        except Exception:
+            seconds = 3600
+        return max(60, seconds)
+
+    def _retry_after(self) -> int:
+        return get_add_friend_rate_limit_retry_after()
+
+    def _enter_rate_limit_cooldown(self, reason: str = "") -> int:
+        retry_after = mark_add_friend_rate_limited(self._cooldown_seconds(), reason)
+        self._log(
+            "WARNING",
+            f"[好友添加] 微信提示操作过于频繁，暂停新的加好友任务 {retry_after}s: {reason}",
+        )
+        return retry_after
+
+    def _rate_limited_response(self, target: str, source: str, reason: str,
+                               retry_after: int) -> dict:
+        return {
+            "status": "rate_limited",
+            "reason": reason,
+            "target": target,
+            "source": source,
+            "ts": time.time(),
+            "errorCode": "WECHAT_ADD_FRIEND_RATE_LIMITED",
+            "retryAfterSeconds": max(0, int(retry_after or 0)),
+            "retryable": True,
+        }
+
     def _reset_daily_if_needed(self) -> None:
         today = time.strftime("%Y-%m-%d")
         if self._today_date != today:
@@ -78,6 +122,10 @@ class _FriendAddService:
             self._reset_daily_if_needed()
             if not self._cfg.get("enabled", False):
                 return False, "好友添加功能未启用"
+
+            retry_after = self._retry_after()
+            if retry_after > 0:
+                return False, f"好友添加暂停中：微信提示操作过于频繁，{retry_after}s 后可重试"
 
             daily_limit = int(self._cfg.get("daily_limit", 20))
             if self._today_count >= daily_limit:
@@ -97,6 +145,9 @@ class _FriendAddService:
             ok, reason = self.can_add_now(target)
             if not ok:
                 self._log("WARNING", f"[好友添加] 拒绝: target={target} reason={reason}")
+                retry_after = self._retry_after()
+                if retry_after > 0:
+                    return self._rate_limited_response(target, source, reason, retry_after)
                 return {"status": "rejected", "reason": reason, "target": target,
                         "source": source, "ts": time.time()}
             self._reset_daily_if_needed()
@@ -107,15 +158,19 @@ class _FriendAddService:
         # 加好友是耗时 UI 操作：持 UI 锁独占，期间 monitor/点赞/其他任务让位，不抢鼠标
         from .mqtt.worker import mqtt_worker
         from .input_blocker import input_blocker
-        ui_lock = mqtt_worker.ui_lock
+        coord = mqtt_worker._coordinator
+        ui_lock = mqtt_worker.ui_lock  # 快照实际 acquire 的锁对象
         _acquired = False
         if ui_lock:
-            _acquired = ui_lock.acquire(timeout=30)
+            _acquired = ui_lock.acquire(timeout=60)
             if not _acquired:
-                self._log("WARNING", "[好友添加] UI 锁获取超时(30s)，仍继续执行")
+                self._log("WARNING", "[好友添加] UI 锁获取超时(60s)，仍继续执行")
+            else:
+                if coord:
+                    coord._wx_busy_event.set()
         input_blocker.set_bot_active(True)
         try:
-            pre_delay = int(bot_config.get("friend_add", {}).get("pre_delay", 1) or 0)
+            pre_delay = int(bot_config.get("friend_add", {}).get("pre_delay", 0) or 0)
             if pre_delay > 0:
                 self._log("INFO", f"加好友前等待 {pre_delay}s（拟人延迟）")
                 time.sleep(pre_delay)
@@ -137,6 +192,12 @@ class _FriendAddService:
                             "nickname": result.get("nickname", target),
                             "remark": remark}
 
+                if result.get("status") == "rate_limited":
+                    reason = result.get("raw") or "操作过于频繁，请稍后再试"
+                    with self._lock:
+                        retry_after = self._enter_rate_limit_cooldown(reason)
+                    return self._rate_limited_response(target, source, reason, retry_after)
+
                 last_result = result
                 self._log("WARNING",
                           f"[好友添加] 失败(target={target}, attempt={attempt}): {result.get('raw', 'unknown')}")
@@ -154,10 +215,18 @@ class _FriendAddService:
             return {"status": "failed", "reason": last_result.get("raw", "unknown"),
                     "target": target, "source": source, "ts": time.time()}
         finally:
-            input_blocker.set_bot_active(False)
+            # 身份比较：我持有的锁是否仍是当前活动锁。被重建则跳过副作用（避免污染新任务）
+            cur_lock = coord._ui_lock if coord else None
+            if _acquired and ui_lock is not cur_lock:
+                self._log("WARNING",
+                          "[好友添加] _exit: 我持有的锁已非当前活动锁（已被重建），跳过副作用")
+            else:
+                input_blocker.set_bot_active(False)
+                if coord:
+                    coord._wx_busy_event.clear()
             if _acquired:
                 try:
-                    ui_lock.release()
+                    ui_lock.release()  # 释放自己 acquire 的那把（快照的 ui_lock）
                 except RuntimeError:
                     pass
 
@@ -170,6 +239,7 @@ class _FriendAddService:
                 "rate_limit_seconds": self._cfg.get("rate_limit_seconds", 60),
                 "today_count": self._today_count,
                 "today_date": self._today_date,
+                "rateLimitRetryAfterSeconds": self._retry_after(),
             }
 
 

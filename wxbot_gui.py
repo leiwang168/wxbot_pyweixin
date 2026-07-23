@@ -2,10 +2,11 @@
 """wxbot 微信机器人 — tkinter 配置界面 + 服务监控。
 
 exe 入口：python wxbot_gui.py 或打包后 wxbot.exe。
-功能：核心配置编辑/保存、服务启停、运行状态监控、实时日志查看。
+功能：完整配置编辑(config.json + webhook.json)/保存、服务启停、运行状态监控、实时日志。
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 import threading
@@ -60,8 +61,16 @@ class WxBotApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("wxbot 微信机器人")
-        self.root.geometry("600x1100")
-        self.root.minsize(600, 800)
+        self.root.update_idletasks()
+        # 启动定位到桌面右上角
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        w = min(640, max(440, screen_w - 40))
+        h = min(900, max(600, screen_h - 40))
+        self.root.minsize(w, min(h, 800))
+        x = max(0, screen_w - w - 20)
+        y = 20
+        self.root.geometry(f"{w}x{h}+{x}+{y}")
 
         self._running = False
         self._start_time: float | None = None
@@ -70,6 +79,16 @@ class WxBotApp:
 
         # 加载配置
         self._cfg = bot_config.load()
+        from wxbot import webhook_send
+        self._webhook_cfg = webhook_send.load_config()
+
+        # 配置控件变量集中管理（key → tk 变量/控件）
+        self._bool_vars: dict[str, tk.BooleanVar] = {}
+        self._str_vars: dict[str, tk.StringVar] = {}
+        self._int_vars: dict[str, tk.StringVar] = {}
+        self._list_boxes: dict[str, tk.Listbox] = {}
+        self._json_editors: dict[str, scrolledtext.ScrolledText] = {}
+        self._text_editors: dict[str, scrolledtext.ScrolledText] = {}
 
         # 选项卡
         self._notebook = ttk.Notebook(root)
@@ -101,145 +120,253 @@ class WxBotApp:
         self._refresh_status()
         self._refresh_log()
 
-    # ---- 配置页 ----
+    # ================================================================
+    # 配置页（嵌套 Notebook 分组：基本信息 / 回复记忆 / 新好友 / 定时 / 朋友圈
+    #   / 数字员工 / MQTT / Webhook / 高级设置）
+    # ================================================================
 
     def _build_config_tab(self) -> None:
         frame = ttk.Frame(self._notebook)
         self._notebook.add(frame, text=" 配置 ")
+        self._cfg_nb = ttk.Notebook(frame)
+        self._cfg_nb.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        self._build_tab_basic()
+        self._build_tab_mqtt()
+        self._build_tab_webhook()
+        self._build_tab_advanced()
 
-        canvas = tk.Canvas(frame)
-        scrollbar = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=canvas.yview)
-        self._config_inner = ttk.Frame(canvas)
-        self._config_inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=self._config_inner, anchor=tk.NW)
-        canvas.configure(yscrollcommand=scrollbar.set)
+    # ---- 滚动页与控件辅助 ----
+    def _scroll_page(self, title: str) -> ttk.Frame:
+        """新建一个可滚动的配置子页，返回内部 Frame。"""
+        page = ttk.Frame(self._cfg_nb)
+        self._cfg_nb.add(page, text=f" {title} ")
+        canvas = tk.Canvas(page, highlightthickness=0)
+        sb = ttk.Scrollbar(page, orient=tk.VERTICAL, command=canvas.yview)
+        inner = ttk.Frame(canvas)
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=inner, anchor=tk.NW)
+        canvas.configure(yscrollcommand=sb.set)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # 鼠标滚轮
-        def _on_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        def _wheel(e):
+            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        # 鼠标进入该页才接管滚轮，避免多 Canvas 互相抢占
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _wheel))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+        return inner
 
-        inner = self._config_inner
-        row = 0
+    def _lf(self, parent: ttk.Frame, title: str) -> ttk.LabelFrame:
+        lf = ttk.LabelFrame(parent, text=title, padding=8)
+        lf.pack(fill=tk.X, padx=4, pady=4)
+        return lf
 
-        # -- 监听设置 --
-        lf1 = ttk.LabelFrame(inner, text="监听设置", padding=8)
-        lf1.grid(row=row, column=0, sticky=tk.EW, padx=4, pady=4)
-        row += 1
+    def _bool(self, parent, key: str, label: str, r: int, c: int = 0, cs: int = 1) -> tk.BooleanVar:
+        var = tk.BooleanVar(value=bool(self._cfg.get(key, False)))
+        self._bool_vars[key] = var
+        ttk.Checkbutton(parent, text=label, variable=var).grid(
+            row=r, column=c, columnspan=cs, sticky=tk.W, pady=1)
+        return var
 
-        ttk.Label(lf1, text="管理员:").grid(row=0, column=0, sticky=tk.W)
-        self._var_admin = tk.StringVar(value=self._cfg.get("admin", ""))
-        ttk.Entry(lf1, textvariable=self._var_admin, width=24).grid(row=0, column=1, sticky=tk.W, padx=4)
+    def _entry(self, parent, key: str, label: str, r: int, width: int = 24,
+               default: str = "", show: str = "") -> tk.StringVar:
+        ttk.Label(parent, text=label).grid(row=r, column=0, sticky=tk.W, pady=2)
+        var = tk.StringVar(value=str(self._cfg.get(key, default)))
+        self._str_vars[key] = var
+        ttk.Entry(parent, textvariable=var, width=width, show=show).grid(
+            row=r, column=1, sticky=tk.W, padx=4, pady=2)
+        return var
 
-        self._var_all_listen = tk.BooleanVar(value=self._cfg.get("AllListen_switch", False))
-        ttk.Radiobutton(lf1, text="白名单模式", variable=self._var_all_listen, value=False).grid(
-            row=1, column=0, sticky=tk.W)
-        ttk.Radiobutton(lf1, text="全局监听", variable=self._var_all_listen, value=True).grid(
-            row=1, column=1, sticky=tk.W)
+    def _int(self, parent, key: str, label: str, r: int, width: int = 8, default=0) -> tk.StringVar:
+        ttk.Label(parent, text=label).grid(row=r, column=0, sticky=tk.W, pady=2)
+        var = tk.StringVar(value=str(self._cfg.get(key, default)))
+        self._int_vars[key] = var
+        ttk.Entry(parent, textvariable=var, width=width).grid(
+            row=r, column=1, sticky=tk.W, padx=4, pady=2)
+        return var
 
-        # 白名单用户
-        ttk.Label(lf1, text="白名单用户:").grid(row=2, column=0, sticky=tk.NW, pady=(6, 0))
-        lf_user = ttk.Frame(lf1)
-        lf_user.grid(row=2, column=1, sticky=tk.W, pady=(6, 0))
-        self._list_listen = tk.Listbox(lf_user, height=4, width=18)
-        self._list_listen.pack(side=tk.LEFT)
-        for u in self._cfg.get("listen_list", []):
-            self._list_listen.insert(tk.END, u)
-        btn_user = ttk.Frame(lf_user)
-        btn_user.pack(side=tk.LEFT, padx=4)
-        ttk.Button(btn_user, text="+", width=3, command=lambda: self._add_to_listbox(
-            self._list_listen, "添加白名单用户")).pack(pady=1)
-        ttk.Button(btn_user, text="-", width=3, command=lambda: self._del_from_listbox(
-            self._list_listen)).pack(pady=1)
+    def _list_edit(self, parent, key: str, label: str, r: int, height: int = 4) -> None:
+        ttk.Label(parent, text=label).grid(row=r, column=0, sticky=tk.NW, pady=2)
+        wrap = ttk.Frame(parent)
+        wrap.grid(row=r, column=1, sticky=tk.W, pady=2)
+        lb = tk.Listbox(wrap, height=height, width=22)
+        lb.pack(side=tk.LEFT)
+        for v in self._cfg.get(key, []):
+            lb.insert(tk.END, v)
+        bf = ttk.Frame(wrap)
+        bf.pack(side=tk.LEFT, padx=4)
+        ttk.Button(bf, text="+", width=3,
+                   command=lambda: self._add_to_listbox(lb, f"添加{label}")).pack(pady=1)
+        ttk.Button(bf, text="-", width=3, command=lambda: self._del_from_listbox(lb)).pack(pady=1)
+        self._list_boxes[key] = lb
 
-        # 监听群组
-        ttk.Label(lf1, text="监听群组:").grid(row=3, column=0, sticky=tk.NW, pady=(6, 0))
-        lf_group = ttk.Frame(lf1)
-        lf_group.grid(row=3, column=1, sticky=tk.W, pady=(6, 0))
-        self._list_group = tk.Listbox(lf_group, height=4, width=18)
-        self._list_group.pack(side=tk.LEFT)
-        for g in self._cfg.get("group", []):
-            self._list_group.insert(tk.END, g)
-        btn_group = ttk.Frame(lf_group)
-        btn_group.pack(side=tk.LEFT, padx=4)
-        ttk.Button(btn_group, text="+", width=3, command=lambda: self._add_to_listbox(
-            self._list_group, "添加群组")).pack(pady=1)
-        ttk.Button(btn_group, text="-", width=3, command=lambda: self._del_from_listbox(
-            self._list_group)).pack(pady=1)
+    def _json_edit(self, parent, key: str, label: str, r: int, height: int = 8, value=None) -> None:
+        ttk.Label(parent, text=label).grid(row=r, column=0, sticky=tk.NW, pady=2)
+        txt = scrolledtext.ScrolledText(parent, width=52, height=height,
+                                        font=("Consolas", 9), wrap=tk.NONE)
+        txt.grid(row=r, column=1, sticky=tk.W, pady=2)
+        if value is None:
+            value = self._cfg.get(key, "")
+        txt.insert("1.0", value if isinstance(value, str)
+                   else json.dumps(value, ensure_ascii=False, indent=2))
+        self._json_editors[key] = txt
 
-        # -- 自动操作 --
-        lf2 = ttk.LabelFrame(inner, text="自动操作", padding=8)
-        lf2.grid(row=row, column=0, sticky=tk.EW, padx=4, pady=4)
-        row += 1
+    def _text_edit(self, parent, key: str, label: str, r: int, height: int = 4, value: str = "") -> None:
+        ttk.Label(parent, text=label).grid(row=r, column=0, sticky=tk.NW, pady=2)
+        txt = scrolledtext.ScrolledText(parent, width=52, height=height, font=("Consolas", 9))
+        txt.grid(row=r, column=1, sticky=tk.W, pady=2)
+        txt.insert("1.0", value or "")
+        self._text_editors[key] = txt
 
-        self._var_transfer = tk.BooleanVar(value=self._cfg.get("auto_collect_transfer", False))
-        ttk.Checkbutton(lf2, text="转账自动收款", variable=self._var_transfer).grid(
-            row=0, column=0, sticky=tk.W)
+    def _kv_entry(self, parent, key: str, label: str, r: int, value,
+                  width: int = 24, show: str = "") -> int:
+        """嵌套字段的键值 Entry（值由调用方传入，存入 _str_vars）。返回下一行号。"""
+        ttk.Label(parent, text=label).grid(row=r, column=0, sticky=tk.W, pady=2)
+        var = tk.StringVar(value=str(value))
+        self._str_vars[key] = var
+        ttk.Entry(parent, textvariable=var, width=width, show=show).grid(
+            row=r, column=1, sticky=tk.W, padx=4, pady=2)
+        return r + 1
 
-        self._var_red_packet = tk.BooleanVar(value=self._cfg.get("auto_open_red_packet", False))
-        ttk.Checkbutton(lf2, text="红包自动拆开", variable=self._var_red_packet).grid(
-            row=0, column=1, sticky=tk.W)
+    # ---- 基本信息 ----
+    def _build_tab_basic(self) -> None:
+        p = self._scroll_page("基本信息")
+        lf = self._lf(p, "身份与监听模式"); r = 0
+        self._entry(lf, "admin", "管理员:", r); r += 1
+        self._bool(lf, "AllListen_switch", "全局监听(黑名单)模式", r); r += 1
+        self._bool(lf, "AllListen_filter_mute", "全局监听过滤免打扰", r); r += 1
+        self._bool(lf, "chat_listen_only", "私聊只监听不回复", r); r += 1
+        self._bool(lf, "group_switch", "群聊监听总开关", r); r += 1
+        self._bool(lf, "group_listen_only", "群聊只监听不回复", r); r += 1
 
-        self._var_group_monitor = tk.BooleanVar(value=self._cfg.get("group_monitor_switch", False))
-        ttk.Checkbutton(lf2, text="群消息关键词监控", variable=self._var_group_monitor).grid(
-            row=1, column=0, sticky=tk.W)
+        lf2 = self._lf(p, "名单"); r = 0
+        self._list_edit(lf2, "listen_list", "白名单用户", r); r += 1
+        self._list_edit(lf2, "group", "监听群组", r); r += 1
+        self._list_edit(lf2, "black_list", "黑名单", r); r += 1
 
-        self._var_new_friend = tk.BooleanVar(value=self._cfg.get("new_friend_switch", False))
-        ttk.Checkbutton(lf2, text="新好友自动回复", variable=self._var_new_friend).grid(
-            row=1, column=1, sticky=tk.W)
+    # ---- MQTT ----
+    def _build_tab_mqtt(self) -> None:
+        p = self._scroll_page("MQTT")
+        m = self._cfg.get("mqtt_worker", {}) or {}
+        broker = m.get("broker", {}) or {}
 
-        self._var_input_block = tk.BooleanVar(value=self._cfg.get("input_block", {}).get("enabled", False))
-        ttk.Checkbutton(lf2, text="屏蔽人工操作", variable=self._var_input_block).grid(
-            row=2, column=0, sticky=tk.W)
+        lf = self._lf(p, "启用与 Broker"); r = 0
+        ve = tk.BooleanVar(value=bool(m.get("enabled", False))); self._bool_vars["mqtt_enabled"] = ve
+        ttk.Checkbutton(lf, text="启用 MQTT", variable=ve).grid(row=r, column=0, sticky=tk.W, pady=1); r += 1
+        ttk.Label(lf, text="Host:").grid(row=r, column=0, sticky=tk.W, pady=2)
+        vh = tk.StringVar(value=str(broker.get("host", "localhost"))); self._str_vars["mqtt_host"] = vh
+        ttk.Entry(lf, textvariable=vh, width=24).grid(row=r, column=1, sticky=tk.W, padx=4); r += 1
+        ttk.Label(lf, text="Port:").grid(row=r, column=0, sticky=tk.W, pady=2)
+        vp = tk.StringVar(value=str(broker.get("port", 1883))); self._int_vars["mqtt_port"] = vp
+        ttk.Entry(lf, textvariable=vp, width=8).grid(row=r, column=1, sticky=tk.W, padx=4); r += 1
+        ttk.Label(lf, text="用户名:").grid(row=r, column=0, sticky=tk.W, pady=2)
+        vu = tk.StringVar(value=str(broker.get("username", ""))); self._str_vars["mqtt_user"] = vu
+        ttk.Entry(lf, textvariable=vu, width=24).grid(row=r, column=1, sticky=tk.W, padx=4); r += 1
+        ttk.Label(lf, text="密码:").grid(row=r, column=0, sticky=tk.W, pady=2)
+        vpw = tk.StringVar(value=str(broker.get("password", ""))); self._str_vars["mqtt_pass"] = vpw
+        ttk.Entry(lf, textvariable=vpw, width=24, show="*").grid(row=r, column=1, sticky=tk.W, padx=4); r += 1
+        ttk.Label(lf, text="Vhost:").grid(row=r, column=0, sticky=tk.W, pady=2)
+        vv = tk.StringVar(value=str(broker.get("vhost", "/"))); self._str_vars["mqtt_vhost"] = vv
+        ttk.Entry(lf, textvariable=vv, width=24).grid(row=r, column=1, sticky=tk.W, padx=4); r += 1
+        vt = tk.BooleanVar(value=bool(broker.get("tls", False))); self._bool_vars["mqtt_tls"] = vt
+        ttk.Checkbutton(lf, text="TLS", variable=vt).grid(row=r, column=0, sticky=tk.W, pady=1); r += 1
+        r = self._kv_entry(lf, "mqtt_correlation_dedup_window", "MQTT消息去重（秒）:", r,
+                           m.get("correlation_dedup_window", 10), width=8)
 
-        # -- 每日启停 --
-        lf3 = ttk.LabelFrame(inner, text="每日启停", padding=8)
-        lf3.grid(row=row, column=0, sticky=tk.EW, padx=4, pady=4)
-        row += 1
+        lf2 = self._lf(p, "MinIO 对象存储"); r = 0
+        minio = m.get("minio", {}) or {}
+        r = self._kv_entry(lf2, "minio_endpoint", "Endpoint:", r, minio.get("endpoint", ""))
+        r = self._kv_entry(lf2, "minio_access_key", "Access Key:", r, minio.get("access_key", ""), show="*")
+        r = self._kv_entry(lf2, "minio_secret_key", "Secret Key:", r, minio.get("secret_key", ""), show="*")
+        r = self._kv_entry(lf2, "minio_bucket", "Bucket:", r, minio.get("bucket", "wbot"))
+        r = self._kv_entry(lf2, "minio_public_url", "公开URL前缀:", r, minio.get("public_url_prefix", ""))
+        vsec = tk.BooleanVar(value=bool(minio.get("secure", True))); self._bool_vars["minio_secure"] = vsec
+        ttk.Checkbutton(lf2, text="Secure (HTTPS)", variable=vsec).grid(row=r, column=0, sticky=tk.W, pady=1)
 
-        self._var_daily_switch = tk.BooleanVar(value=self._cfg.get("everyday_start_stop_bot_switch", False))
-        ttk.Checkbutton(lf3, text="启用每日启停", variable=self._var_daily_switch).grid(
-            row=0, column=0, columnspan=2, sticky=tk.W)
+        lf3 = self._lf(p, "Worker 身份（管理第 1 个身份；多身份请编辑 config.json）"); r = 0
+        wk = (m.get("workers", []) or [{}])[0] or {}
+        topics = wk.get("topics", {}) or {}
+        vwe = tk.BooleanVar(value=bool(wk.get("enabled", True))); self._bool_vars["wk_enabled"] = vwe
+        ttk.Checkbutton(lf3, text="启用", variable=vwe).grid(row=r, column=0, sticky=tk.W, pady=1); r += 1
+        r = self._kv_entry(lf3, "wk_role", "Role:", r, wk.get("role", "default"))
+        r = self._kv_entry(lf3, "wk_agent_id", "Agent ID:", r, wk.get("agent_id", "wx_001"))
+        r = self._kv_entry(lf3, "wk_subscribe", "Subscribe Topic:", r, topics.get("subscribe", ""))
+        r = self._kv_entry(lf3, "wk_callback", "Callback Prefix:", r, topics.get("callback_prefix", ""))
+        r = self._kv_entry(lf3, "wk_forward", "Forward Topic:", r, topics.get("forward", ""))
+        ttk.Label(lf3, text="转发联系人:").grid(row=r, column=0, sticky=tk.NW, pady=2)
+        wrap = ttk.Frame(lf3); wrap.grid(row=r, column=1, sticky=tk.W, pady=2)
+        lb = tk.Listbox(wrap, height=4, width=22); lb.pack(side=tk.LEFT)
+        for c in (wk.get("forward_contacts", []) or []):
+            lb.insert(tk.END, c)
+        bf = ttk.Frame(wrap); bf.pack(side=tk.LEFT, padx=4)
+        ttk.Button(bf, text="+", width=3,
+                   command=lambda: self._add_to_listbox(lb, "添加转发联系人")).pack(pady=1)
+        ttk.Button(bf, text="-", width=3, command=lambda: self._del_from_listbox(lb)).pack(pady=1)
+        self._list_boxes["wk_forward_contacts"] = lb
 
-        ttk.Label(lf3, text="停止时间:").grid(row=1, column=0, sticky=tk.W, pady=(4, 0))
-        self._var_stop_time = tk.StringVar(value=self._cfg.get("everyday_stop_bot_time", "23:00"))
-        ttk.Entry(lf3, textvariable=self._var_stop_time, width=8).grid(row=1, column=1, sticky=tk.W, pady=(4, 0))
+    # ---- Webhook ----
+    def _build_tab_webhook(self) -> None:
+        p = self._scroll_page("Webhook")
+        w = self._webhook_cfg
+        lf = self._lf(p, "飞书 / Webhook 通知"); r = 0
+        ve = tk.BooleanVar(value=bool(w.get("enabled", False))); self._bool_vars["wh_enabled"] = ve
+        ttk.Checkbutton(lf, text="启用 Webhook", variable=ve).grid(row=r, column=0, sticky=tk.W, pady=1); r += 1
+        ttk.Label(lf, text="URL:").grid(row=r, column=0, sticky=tk.W, pady=2)
+        vu = tk.StringVar(value=str(w.get("url", ""))); self._str_vars["wh_url"] = vu
+        ttk.Entry(lf, textvariable=vu, width=40).grid(row=r, column=1, sticky=tk.W, padx=4); r += 1
+        ttk.Label(lf, text="Method:").grid(row=r, column=0, sticky=tk.W, pady=2)
+        vm = tk.StringVar(value=str(w.get("method", "POST"))); self._str_vars["wh_method"] = vm
+        ttk.Entry(lf, textvariable=vm, width=10).grid(row=r, column=1, sticky=tk.W, padx=4); r += 1
+        ttk.Label(lf, text="Content-Type:").grid(row=r, column=0, sticky=tk.W, pady=2)
+        vc = tk.StringVar(value=str(w.get("content_type", "application/json"))); self._str_vars["wh_ct"] = vc
+        ttk.Entry(lf, textvariable=vc, width=24).grid(row=r, column=1, sticky=tk.W, padx=4); r += 1
+        ttk.Label(lf, text="Timeout(秒):").grid(row=r, column=0, sticky=tk.W, pady=2)
+        vt = tk.StringVar(value=str(w.get("timeout", 5))); self._int_vars["wh_timeout"] = vt
+        ttk.Entry(lf, textvariable=vt, width=8).grid(row=r, column=1, sticky=tk.W, padx=4); r += 1
 
-        ttk.Label(lf3, text="恢复时间:").grid(row=1, column=2, sticky=tk.W, padx=(12, 0), pady=(4, 0))
-        self._var_start_time = tk.StringVar(value=self._cfg.get("everyday_start_bot_time", "08:00"))
-        ttk.Entry(lf3, textvariable=self._var_start_time, width=8).grid(row=1, column=3, sticky=tk.W, pady=(4, 0))
+        lf2 = self._lf(p, "Headers (JSON)")
+        self._json_edit(lf2, "wh_headers", "headers", 0, height=5, value=w.get("headers", {}))
+        lf3 = self._lf(p, "Body 模板 (支持 $title / $content)")
+        self._text_edit(lf3, "wh_body", "body", 0, height=6, value=w.get("body", ""))
 
-        # -- MQTT设置 --
-        lf4 = ttk.LabelFrame(inner, text="MQTT 设置", padding=8)
-        lf4.grid(row=row, column=0, sticky=tk.EW, padx=4, pady=4)
-        row += 1
+    # ---- 高级设置 ----
+    def _build_tab_advanced(self) -> None:
+        p = self._scroll_page("高级设置")
+        lf = self._lf(p, "运行参数"); r = 0
+        self._int(lf, "monitor_check_interval", "监听轮询间隔(秒)", r); r += 1
+        self._int(lf, "monitor_run_timeout", "单轮超时(秒)", r); r += 1
+        self._int(lf, "contacts_refresh_timeout", "联系人刷新超时(秒)", r); r += 1
+        self._int(lf, "voice_message_delay", "语音转文字等待(秒)", r); r += 1
 
-        mqtt_cfg = self._cfg.get("mqtt_worker", {})
-        self._var_mqtt_enabled = tk.BooleanVar(value=mqtt_cfg.get("enabled", False))
-        ttk.Checkbutton(lf4, text="启用 MQTT", variable=self._var_mqtt_enabled).grid(
-            row=0, column=0, columnspan=2, sticky=tk.W)
+        lf2 = self._lf(p, "自动操作与转发"); r = 0
+        self._bool(lf2, "auto_collect_transfer", "转账自动收款", r, c=0)
+        self._bool(lf2, "auto_open_red_packet", "红包自动拆开", r, c=1); r += 1
+        self._bool(lf2, "group_monitor_switch", "群关键词监控", r, c=0); r += 1
+        self._json_edit(lf2, "group_monitor_list", "group_monitor_list", r, height=5); r += 1
+        self._bool(lf2, "custom_forward_switch", "自定义转发", r); r += 1
+        self._json_edit(lf2, "custom_forward_list", "custom_forward_list", r, height=5); r += 1
 
-        broker = mqtt_cfg.get("broker", {})
-        ttk.Label(lf4, text="Broker:").grid(row=1, column=0, sticky=tk.W, pady=(4, 0))
-        host = broker.get("host", "localhost")
-        port = broker.get("port", 1883)
-        self._var_mqtt_broker = tk.StringVar(value=f"{host}:{port}")
-        ttk.Entry(lf4, textvariable=self._var_mqtt_broker, width=20).grid(
-            row=1, column=1, sticky=tk.W, pady=(4, 0))
+        lf3 = self._lf(p, "群欢迎"); r = 0
+        self._bool(lf3, "group_welcome", "启用入群欢迎", r); r += 1
+        self._entry(lf3, "group_welcome_msg", "欢迎语", r); r += 1
+        self._entry(lf3, "group_welcome_random", "欢迎随机度(0~1)", r, width=8); r += 1
 
-        ttk.Label(lf4, text="用户名:").grid(row=2, column=0, sticky=tk.W, pady=(4, 0))
-        self._var_mqtt_user = tk.StringVar(value=broker.get("username", ""))
-        ttk.Entry(lf4, textvariable=self._var_mqtt_user, width=20).grid(
-            row=2, column=1, sticky=tk.W, pady=(4, 0))
+        lf4 = self._lf(p, "每日启停"); r = 0
+        self._bool(lf4, "everyday_start_stop_bot_switch", "启用每日启停", r); r += 1
+        self._entry(lf4, "everyday_stop_bot_time", "停止时间", r, width=8); r += 1
+        self._entry(lf4, "everyday_start_bot_time", "恢复时间", r, width=8); r += 1
 
-        ttk.Label(lf4, text="密码:").grid(row=3, column=0, sticky=tk.W, pady=(4, 0))
-        self._var_mqtt_pass = tk.StringVar(value=broker.get("password", ""))
-        ttk.Entry(lf4, textvariable=self._var_mqtt_pass, width=20, show="*").grid(
-            row=3, column=1, sticky=tk.W, pady=(4, 0))
+        lf5 = self._lf(p, "人工操作屏蔽"); r = 0
+        ib = self._cfg.get("input_block", {}) or {}
+        ve = tk.BooleanVar(value=bool(ib.get("enabled", False))); self._bool_vars["ib_enabled"] = ve
+        ttk.Checkbutton(lf5, text="启用屏蔽", variable=ve).grid(row=r, column=0, sticky=tk.W, pady=1); r += 1
+        ttk.Label(lf5, text="自动解除(分钟):").grid(row=r, column=0, sticky=tk.W, pady=2)
+        va = tk.StringVar(value=str(ib.get("auto_release_minutes", 30))); self._int_vars["ib_auto_release"] = va
+        ttk.Entry(lf5, textvariable=va, width=8).grid(row=r, column=1, sticky=tk.W, padx=4); r += 1
 
-    # ---- 状态页 ----
+    # ================================================================
+    # 状态页 / 日志页
+    # ================================================================
 
     def _build_status_tab(self) -> None:
         frame = ttk.Frame(self._notebook, padding=12)
@@ -264,8 +391,6 @@ class WxBotApp:
             ttk.Label(frame, textvariable=var, font=("", 10)).grid(
                 row=i, column=1, sticky=tk.W, padx=(12, 0), pady=3)
 
-    # ---- 日志页 ----
-
     def _build_log_tab(self) -> None:
         frame = ttk.Frame(self._notebook)
         self._notebook.add(frame, text=" 日志 ")
@@ -274,60 +399,153 @@ class WxBotApp:
                                                     state=tk.DISABLED, bg="#1e1e1e", fg="#d4d4d4")
         self._log_text.pack(fill=tk.BOTH, expand=True)
 
-    # ---- 操作 ----
+    # ================================================================
+    # 列表编辑 / 保存 / 启停
+    # ================================================================
 
     def _add_to_listbox(self, listbox: tk.Listbox, title: str) -> None:
-        """弹出输入框，向列表添加一项。"""
         from tkinter import simpledialog
         val = simpledialog.askstring(title, "请输入名称:")
         if val and val.strip():
             listbox.insert(tk.END, val.strip())
 
     def _del_from_listbox(self, listbox: tk.Listbox) -> None:
-        """删除列表中选中项。"""
         sel = listbox.curselection()
         if sel:
             listbox.delete(sel[0])
 
     def _save_config(self) -> None:
-        """将界面值写回 bot_config 并持久化。"""
+        """将界面值写回 bot_config(→config.json) 与 webhook_send(→webhook.json) 并持久化。"""
         try:
-            bot_config.set("admin", self._var_admin.get())
-            bot_config.set("AllListen_switch", self._var_all_listen.get())
-            bot_config.set("listen_list", list(self._list_listen.get(0, tk.END)))
-            bot_config.set("group", list(self._list_group.get(0, tk.END)))
-            bot_config.set("auto_collect_transfer", self._var_transfer.get())
-            bot_config.set("auto_open_red_packet", self._var_red_packet.get())
-            bot_config.set("group_monitor_switch", self._var_group_monitor.get())
-            bot_config.set("new_friend_switch", self._var_new_friend.get())
-            bot_config.set("everyday_start_stop_bot_switch", self._var_daily_switch.get())
-            bot_config.set("everyday_stop_bot_time", self._var_stop_time.get())
-            bot_config.set("everyday_start_bot_time", self._var_start_time.get())
+            _FLOAT_KEYS = {"knowledge_threshold", "group_welcome_random"}
 
-            # input_block
+            # bool 标量（跳过特殊前缀，下面单独处理 mqtt/wh/ib/minio/wk）
+            for k, v in self._bool_vars.items():
+                if (k in ("mqtt_enabled", "mqtt_tls", "wh_enabled", "ib_enabled")
+                        or k.startswith(("minio_", "wk_"))):
+                    continue
+                bot_config.set(k, v.get())
+            # str 标量
+            for k, v in self._str_vars.items():
+                if k.startswith(("mqtt_", "wh_", "minio_", "wk_")):
+                    continue
+                val: object = v.get()
+                if k in _FLOAT_KEYS:
+                    try:
+                        val = float(val)
+                    except ValueError:
+                        pass
+                bot_config.set(k, val)
+            # int 标量
+            for k, v in self._int_vars.items():
+                if k.startswith("mqtt_") or k.startswith("wh_") or k.startswith("ib_"):
+                    continue
+                try:
+                    bot_config.set(k, int(v.get()))
+                except ValueError:
+                    bot_config.set(k, v.get())
+            # 列表（跳过 wk_ 前缀，归属 worker 单独处理）
+            for k, lb in self._list_boxes.items():
+                if k.startswith("wk_"):
+                    continue
+                bot_config.set(k, list(lb.get(0, tk.END)))
+            # JSON 编辑器（跳过 wh_headers，单独处理）
+            for k, txt in self._json_editors.items():
+                if k == "wh_headers":
+                    continue
+                raw = txt.get("1.0", tk.END).strip()
+                if raw:
+                    try:
+                        bot_config.set(k, json.loads(raw))
+                    except json.JSONDecodeError:
+                        raise ValueError(f"{k} 的 JSON 格式错误")
+                else:
+                    bot_config.set(k, [] if k.endswith("_list")
+                                   else {} if (k.endswith("_map") or k.endswith("_dict")
+                                               or k in ("friend_add", "api_configs")) else "")
+
+            # ---- MQTT（合并 broker entry + extra JSON）----
+            mqtt = dict(bot_config.get("mqtt_worker", {}))
+            mqtt["enabled"] = self._bool_vars["mqtt_enabled"].get()
+            broker = mqtt.setdefault("broker", {})
+            broker["host"] = self._str_vars["mqtt_host"].get().strip() or "localhost"
+            try:
+                broker["port"] = int(self._int_vars["mqtt_port"].get())
+            except ValueError:
+                broker["port"] = 1883
+            broker["username"] = self._str_vars["mqtt_user"].get()
+            broker["password"] = self._str_vars["mqtt_pass"].get()
+            broker["vhost"] = self._str_vars["mqtt_vhost"].get() or "/"
+            broker["tls"] = self._bool_vars["mqtt_tls"].get()
+            try:
+                mqtt["correlation_dedup_window"] = max(1, int(self._str_vars["mqtt_correlation_dedup_window"].get()))
+            except (KeyError, ValueError):
+                mqtt["correlation_dedup_window"] = 10
+            # MinIO（每个字段独立）
+            mqtt["minio"] = {
+                "endpoint": self._str_vars["minio_endpoint"].get(),
+                "access_key": self._str_vars["minio_access_key"].get(),
+                "secret_key": self._str_vars["minio_secret_key"].get(),
+                "bucket": self._str_vars["minio_bucket"].get() or "wbot",
+                "secure": self._bool_vars["minio_secure"].get(),
+                "public_url_prefix": self._str_vars["minio_public_url"].get(),
+            }
+            # Worker 身份（更新第 1 个，保留其余）
+            new_wk = {
+                "enabled": self._bool_vars["wk_enabled"].get(),
+                "role": self._str_vars["wk_role"].get() or "default",
+                "agent_id": self._str_vars["wk_agent_id"].get(),
+                "topics": {
+                    "subscribe": self._str_vars["wk_subscribe"].get(),
+                    "callback_prefix": self._str_vars["wk_callback"].get(),
+                    "forward": self._str_vars["wk_forward"].get(),
+                },
+                "forward_contacts": list(self._list_boxes["wk_forward_contacts"].get(0, tk.END)),
+            }
+            workers = list(mqtt.get("workers", []) or [])
+            if workers:
+                workers[0] = new_wk
+            else:
+                workers = [new_wk]
+            mqtt["workers"] = workers
+            bot_config.set("mqtt_worker", mqtt)
+
+            # ---- input_block ----
             ib = dict(bot_config.get("input_block", {}))
-            ib["enabled"] = self._var_input_block.get()
+            ib["enabled"] = self._bool_vars["ib_enabled"].get()
+            try:
+                ib["auto_release_minutes"] = int(self._int_vars["ib_auto_release"].get())
+            except ValueError:
+                ib["auto_release_minutes"] = 30
             bot_config.set("input_block", ib)
 
-            # MQTT
-            mqtt = dict(bot_config.get("mqtt_worker", {}))
-            mqtt["enabled"] = self._var_mqtt_enabled.get()
-            broker_str = self._var_mqtt_broker.get().strip()
-            if ":" in broker_str:
-                h, p = broker_str.rsplit(":", 1)
+            # ---- webhook.json ----
+            wh = dict(self._webhook_cfg)
+            wh["enabled"] = self._bool_vars["wh_enabled"].get()
+            wh["url"] = self._str_vars["wh_url"].get().strip()
+            wh["method"] = (self._str_vars["wh_method"].get() or "POST").upper()
+            wh["content_type"] = self._str_vars["wh_ct"].get() or "application/json"
+            try:
+                wh["timeout"] = int(self._int_vars["wh_timeout"].get())
+            except ValueError:
+                wh["timeout"] = 5
+            hdr_raw = self._json_editors["wh_headers"].get("1.0", tk.END).strip()
+            if hdr_raw:
                 try:
-                    mqtt.setdefault("broker", {})["host"] = h.strip()
-                    mqtt.setdefault("broker", {})["port"] = int(p.strip())
-                except ValueError:
-                    pass
-            mqtt.setdefault("broker", {})["username"] = self._var_mqtt_user.get()
-            mqtt.setdefault("broker", {})["password"] = self._var_mqtt_pass.get()
-            bot_config.set("mqtt_worker", mqtt)
+                    wh["headers"] = json.loads(hdr_raw)
+                except json.JSONDecodeError:
+                    raise ValueError("Webhook Headers 的 JSON 格式错误")
+            else:
+                wh["headers"] = {}
+            wh["body"] = self._text_editors["wh_body"].get("1.0", tk.END).rstrip("\n")
+            from wxbot import webhook_send
+            webhook_send.save_config(wh)
+            self._webhook_cfg = webhook_send.load_config()
 
             bot_config.save()
             self._cfg = bot_config.cfg
             self._status_var.set("配置已保存 ✓")
-            messagebox.showinfo("保存成功", "配置已保存到 config/config.json")
+            messagebox.showinfo("保存成功", "配置已保存（config.json + webhook.json）")
         except Exception as e:
             messagebox.showerror("保存失败", str(e))
 
@@ -350,11 +568,32 @@ class WxBotApp:
             self._monitor = _monitor
             self._mqtt_worker = mqtt_worker
 
+            # 人工操作屏蔽（与 main.py 一致：勾选则装低级鼠标钩子并启用）
+            _ib = bot_config.get("input_block", {}) or {}
+            if _ib.get("enabled"):
+                try:
+                    from wxbot.input_blocker import input_blocker
+                    input_blocker.configure(auto_release_minutes=_ib.get("auto_release_minutes", 30))
+                    input_blocker.start()
+                    input_blocker.enable(reason="GUI 启动")
+                    log.info("🛡 人工操作屏蔽已启用（Ctrl+Alt+X 或 /解除屏蔽 解除）")
+                except Exception as e:
+                    log.warning(f"人工操作屏蔽启动失败: {e}")
+
             def _run():
                 try:
                     _monitor.loop()
                 except Exception as e:
                     log.error(f"服务异常: {e}")
+                    try:
+                        from wxbot.exception_alert import send_client_exception_alert
+                        send_client_exception_alert(
+                            title="【GUI服务异常】",
+                            exc=e,
+                            screenshot_reason="gui_service_exception",
+                        )
+                    except Exception:
+                        pass
 
             self._thread = threading.Thread(target=_run, daemon=True)
             self._thread.start()
@@ -373,6 +612,16 @@ class WxBotApp:
         try:
             if self._monitor:
                 self._monitor.stop()
+            if self._mqtt_worker:
+                self._mqtt_worker.shutdown()
+            # 停止人工操作屏蔽（解除并卸载钩子）
+            try:
+                from wxbot.input_blocker import input_blocker
+                if input_blocker._started:
+                    input_blocker.disable(reason="GUI 停止")
+                    input_blocker.stop()
+            except Exception as e:
+                log.warning(f"人工操作屏蔽停止失败: {e}")
             self._running = False
             self._start_time = None
             self._btn_start.config(state=tk.NORMAL)
@@ -440,8 +689,27 @@ class WxBotApp:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    # DPI 感知：PyInstaller exe 默认不声明 DPI 感知，高 DPI 缩放下
+    # winfo_screenwidth 与 geometry 坐标系不一致，导致窗口定位偏移。必须在 root 创建前调用。
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)  # 1=系统级 DPI 感知
+    except Exception:
+        pass
+    # Splash 文字更新（仅打包环境存在 pyi_splash，开发模式 try/except 兜底）
+    try:
+        import pyi_splash
+        pyi_splash.update_text("正在初始化界面...")
+    except Exception:
+        pass
     root = tk.Tk()
     app = WxBotApp(root)
+    # 主窗口就绪，关闭 splash
+    try:
+        import pyi_splash
+        pyi_splash.close()
+    except Exception:
+        pass
 
     def _on_close():
         if app._running:

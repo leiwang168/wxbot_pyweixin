@@ -23,20 +23,37 @@ def _ui_lock():
 
     发朋友圈、点赞都是耗时 UI 操作；持锁期间其他轮询（monitor 消息轮询、点赞循环）
     让位，避免抢鼠标 / 页面状态冲突。锁不可用（MQTT 未启用）时不阻塞，仅记录。
+
+    同时 set/clear wx_busy_event，让 executor 礼让；记录 epoch，若锁被重建则
+    _exit 时跳过副作用（与 executor/worker 一致）。
     """
+    from .input_blocker import input_blocker
     from .mqtt.worker import mqtt_worker
-    lock = mqtt_worker.ui_lock
+    coord = mqtt_worker._coordinator
+    lock = mqtt_worker.ui_lock  # 快照实际 acquire 的锁对象
     acquired = False
     if lock:
-        acquired = lock.acquire(timeout=30)
+        acquired = lock.acquire(timeout=60)
         if not acquired:
-            log.warning("[朋友圈] UI 锁获取超时(30s)，仍继续执行")
+            log.warning("[朋友圈] UI 锁获取超时(60s)，仍继续执行")
+        else:
+            if coord:
+                coord._wx_busy_event.set()
+            input_blocker.set_bot_active(True)
     try:
         yield
     finally:
         if acquired:
+            # 身份比较：我持有的锁是否仍是当前活动锁。被重建则跳过副作用
+            cur_lock = coord._ui_lock if coord else None
+            if lock is not cur_lock:
+                log.warning("[朋友圈] _exit: 我持有的锁已非当前活动锁（已被重建），跳过副作用")
+            else:
+                input_blocker.set_bot_active(False)
+                if coord:
+                    coord._wx_busy_event.clear()
             try:
-                lock.release()
+                lock.release()  # 释放自己 acquire 的那把（快照的 lock）
             except RuntimeError:
                 pass
 

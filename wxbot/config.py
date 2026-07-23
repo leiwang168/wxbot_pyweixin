@@ -39,6 +39,7 @@ DEFAULTS: dict[str, Any] = {
     "monitor_check_interval": 10,        # 消息监听轮询间隔（秒）
     "monitor_run_timeout": 30,           # 单轮 run_once 超时（秒），防 UI 操作死锁拖垮主循环
     "contacts_refresh_timeout": 300,     # 联系人全量缓存刷新超时（秒），config 可配
+    "voice_message_delay": 5,            # 收到语音消息后等待转文字的延迟（秒），0=不等待
     # 关键词
     "chat_keyword_switch": False,
     "group_keyword_switch": False,
@@ -128,6 +129,7 @@ DEFAULTS: dict[str, Any] = {
             "tls": False,
         },
         "task_timeout": 10,
+        "correlation_dedup_window": 10,  # correlationId dedupe window in seconds
         "close_chat_window": True,
         "close_chat_window_delay": 1.0,
         "skip_local_reply_when_forwarded": True,  # 转发到上游后跳过本地 AI 回复
@@ -202,6 +204,15 @@ def _normalize(raw: dict[str, Any]) -> dict[str, Any]:
     # 监听轮询间隔（秒）+ 单轮超时（秒）
     cfg["monitor_check_interval"] = _coerce_int(cfg.get("monitor_check_interval", 10), 10, 1, 3600)
     cfg["monitor_run_timeout"] = _coerce_int(cfg.get("monitor_run_timeout", 30), 30, 5, 600)
+
+    # MQTT nested config completion and range checks
+    mqtt_defaults = dict(DEFAULTS.get("mqtt_worker", {}))
+    mqtt_raw = cfg.get("mqtt_worker", {})
+    if isinstance(mqtt_raw, dict):
+        mqtt_defaults.update(mqtt_raw)
+    mqtt_defaults["correlation_dedup_window"] = _coerce_int(
+        mqtt_defaults.get("correlation_dedup_window", 10), 10, 1, 86400)
+    cfg["mqtt_worker"] = mqtt_defaults
 
     # 列表/字典类型兜底
     for k in ("listen_list", "group", "new_friend_msg", "new_friend_tags",

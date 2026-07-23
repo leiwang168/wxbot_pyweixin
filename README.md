@@ -3,6 +3,11 @@
 基于 [pyweixin](https://github.com/Hello-Mr-Crab/pywechat) SDK（`pywinauto` UI 自动化）的可配置微信机器人，复刻 [SiverWXbot_plus](https://github.com/SiverKing/SiverWXbot_plus) 的核心配置能力，**不依赖付费的 `wxautox4`**。 
 
 
+## 📚 文档
+
+- [接口文档](./docs/API.md) — 分层架构、pyweixin/wxbot API、MQTT 任务接口、Webhook、配置参考
+- [操作手册](./docs/MANUAL.md) — 安装运行、配置详解、admin 指令、MQTT 接入、运维排障
+
 ## 功能概览
 
 ## 配合openclaw agent 一起使用，可以让龙虾帮你远程操作wx机器人，支持一对多模式，一个龙虾，多个wx机器人客户端，通过MQTT通讯。
@@ -28,6 +33,13 @@
 - ✅ **数字员工编排** — 转人工 → 知识库 → AI（带客户档案上下文）三级决策
 - ✅ **管理指令** — 岗位列表/绑定、客户列表/档案/状态/备注、数字员工与转人工开关、知识库重载
 
+### 阶段三（韧性加固与能力补全）
+- ✅ **被删/被拉黑检测** — 发消息后自动检测对方是否删除/拉黑，飞书告警 + MQTT 系统事件回执
+- ✅ **按备注查微信号** — `ContactResolver.find_wxid_by_remark`，多候选取第一个
+- ✅ **底层操作降速** — 加好友/发朋友圈 UI 步骤间加入拟人等待，避免 UI 未就绪失败
+- ✅ **异常自恢复** — 主循环单轮兜底 + 意外退出 5s 自动恢复，异常不中断主干
+- ✅ **互斥加固** — UI 锁/防回环指纹/屏蔽器跨线程访问加锁，锁重建身份比较防污染
+
 ## 环境要求
 
 - Windows 10/11 64-bit
@@ -50,9 +62,64 @@ python main.py
 
 首次运行自动生成 `config/config.json`，按需编辑后重启或发 `/重载配置`。
 
+## 图形界面 (GUI)
+
+`wxbot_gui.py` 提供 tkinter 配置界面（可视化编辑配置、启停服务、实时日志）：
+
+```powershell
+set PYTHONUTF8=1
+python wxbot_gui.py
+```
+
+## 打包成 exe
+
+打包为单文件 `wxbot.exe`（内置启动 Splash，覆盖 bootloader 解压 + import 的等待期）：
+
+```powershell
+# 1. 安装打包工具（PyInstaller 5.0+，当前验证 6.21.0）
+pip install opencv-python pyinstaller
+
+# 2. 按配置打包（onefile, 无控制台）
+pyinstaller wxbot_gui.spec
+
+# 3. 产物
+#    dist/wxbot.exe          ← 双击运行（首次启动数秒，期间显示 Splash）
+#    dist/wxbot.exe 同级需放 config/  目录（config.json 等运行时配置）
+```
+
+### 打包资源说明
+
+`wxbot_gui.spec` 已配置打包以下资源：
+
+| 资源 | 路径 | 用途 |
+|------|------|------|
+| 模板图 | `config/images/*.png` | OpenCV 模板匹配（转账收款、红包拆开、弹框清理等按钮定位） |
+| Splash | `config/images/splash.png` | 启动 Loading 画面（可自行替换，建议 480×300） |
+
+**必需的模板图**（缺失则对应功能静默降级，不报错）：
+
+- `shoukuan_btn.png` — 转账"收款"按钮
+- `hongbao_btn.png` — 红包"开"按钮
+- `confirm_btn.png` — 微信提示弹框"确定"按钮（操作频繁等）
+- `unlock_btn.png`（可选）— 解锁提示按钮
+
+### 打包后目录结构
+
+```
+发布目录/
+├── wxbot.exe            # 主程序
+└── config/              # 运行时配置（可编辑）
+    ├── config.json      # 主配置
+    ├── persona/         # 岗位人设
+    ├── knowledge.json   # FAQ
+    └── images/          # 模板图（如改动需同步）
+```
+
+> 注：`build/`、`dist/` 为打包产物（未纳入版本管理）；重新打包前可删除确保干净。
+
 ## 配置说明
 
-完整字段见 `wxbot/config.py` 的 `DEFAULTS`（50 项）。关键项：
+完整字段见 `wxbot/config.py` 的 `DEFAULTS`（50 项），分组详解与运维见 [操作手册](./docs/MANUAL.md)。关键项：
 
 | 字段 | 说明 |
 |---|---|
@@ -127,6 +194,7 @@ python main.py
 wxbot_pyweixin/
 ├── main.py              # 入口（解析 wxid、启动调度器与主循环）
 ├── pyweixin/            # 内嵌 SDK（源自 pywechat/src/pyweixin）
+├── docs/                # 接口文档与操作手册
 ├── config/config.json   # 首次运行自动生成
 ├── memory/<wxid>/...    # 对话记忆（运行时生成）
 ├── logs/                # 运行日志
@@ -147,6 +215,9 @@ wxbot_pyweixin/
     ├── knowledge.py     # FAQ 知识库
     ├── customer.py      # 客户档案 CRM
     ├── employee.py      # 数字员工编排（转人工/知识库/AI）
+    ├── input_blocker.py # 人工操作屏蔽（低级鼠标钩子）
+    ├── friend_add.py    # 主动加好友扩展
+    ├── webhook_send.py  # 飞书 Webhook 通知
     └── logger.py
 ```
 

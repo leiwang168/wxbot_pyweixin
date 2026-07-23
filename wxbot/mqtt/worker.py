@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -22,7 +23,7 @@ from pyweixin.Uielements import Windows
 from ..config import bot_config
 from ..input_blocker import input_blocker
 from .adapter import MqttAdapter
-from .common import MinioUploader, emit
+from .common import DEFAULT_DEDUP_WINDOW, MinioUploader, emit
 from .coordinator import MqttCoordinator
 from .executor import TaskExecutor
 from .identity import WorkerIdentity
@@ -32,6 +33,66 @@ from ..paths import get_config_dir
 
 _CONFIG_PATH = os.path.join(get_config_dir(), "config.json")
 _OPERATE_CACHE_PATH = os.path.join(get_config_dir(), "operate_cache.json")
+
+
+
+class _MqttProcessLock:
+    """Best-effort inter-process lock for one MQTT subscription set."""
+
+    def __init__(self, path: str, label: str) -> None:
+        self.path = path
+        self.label = label
+        self._fh = None
+
+    def acquire(self) -> bool:
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        self._fh = open(self.path, "a+", encoding="utf-8")
+        try:
+            self._fh.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self._close()
+            return False
+        self._fh.seek(0)
+        self._fh.truncate()
+        self._fh.write(json.dumps({
+            "pid": os.getpid(),
+            "label": self.label,
+            "startedAt": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }, ensure_ascii=False))
+        self._fh.flush()
+        try:
+            os.fsync(self._fh.fileno())
+        except OSError:
+            pass
+        return True
+
+    def release(self) -> None:
+        if not self._fh:
+            return
+        try:
+            self._fh.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        self._close()
+
+    def _close(self) -> None:
+        try:
+            if self._fh:
+                self._fh.close()
+        finally:
+            self._fh = None
 
 
 def _patch_open_friend_profile():
@@ -89,7 +150,13 @@ class MqttWorkerExtension:
         self._wx_wechat_id = ""
         self._session_operate: dict[str, str] = {}  # {chat: operate} 会话级 operate 追踪
         self._last_sent: dict[str, tuple[str, float]] = {}  # {chat: (text, ts)} 防回环
+        # Deduplicate send_text active detection and monitor fallback for the same WeChat system receipt.
+        self._contact_unreachable_alerts: dict[tuple[str, str], float] = {}
+        self._contact_unreachable_alert_ttl = 60.0
+        self._alert_lock = threading.Lock()
         self._operate_lock = threading.Lock()
+        self._ui_tls = threading.local()  # 锁归属状态（epoch/acquired），线程局部
+        self._process_lock: _MqttProcessLock | None = None
 
     # ---- operate 持久化（manual 接管重启不丢）----
     def set_session_operate(self, chat: str, val: str) -> None:
@@ -105,6 +172,18 @@ class MqttWorkerExtension:
                 json.dump(snapshot, f, ensure_ascii=False, indent=2)
         except Exception as e:
             emit("WARNING", f"写入 operate 缓存失败: {e}")
+
+    # ---- 防回环指纹（跨线程读写：MQTT 协调器写、上行转发读，用 _operate_lock 保护）----
+    def record_last_sent(self, chat: str, text: str) -> None:
+        """记录最近向 chat 发送的消息指纹，供上行转发防回环。线程安全。"""
+        with self._operate_lock:
+            self._last_sent[chat] = (text, time.time())
+
+    def is_recent_sent(self, chat: str, text: str, ttl: float = 30.0) -> bool:
+        """是否为 ttl 秒内由 bot 发出的同文本消息（回环判定）。线程安全。"""
+        with self._operate_lock:
+            last = self._last_sent.get(chat)
+        return bool(last and last[0] == text and time.time() - last[1] < ttl)
 
     def _load_operate_cache(self) -> dict:
         if not os.path.exists(_OPERATE_CACHE_PATH):
@@ -165,8 +244,56 @@ class MqttWorkerExtension:
             self._resolver = ContactResolver(log_func=emit)
         return self._resolver
 
+    @staticmethod
+    def _process_lock_label(workers_cfg: list) -> str:
+        topics: list[str] = []
+        for worker in workers_cfg:
+            if not worker.get("enabled", True):
+                continue
+            role = (worker.get("role") or "").strip()
+            topic = ((worker.get("topics", {}) or {}).get("subscribe") or "").strip()
+            if topic and "{role}" in topic:
+                topic = topic.replace("{role}", role)
+            if topic:
+                topics.append(topic)
+        return "|".join(sorted(set(topics))) or "mqtt-worker"
+
+    def _acquire_process_lock(self, workers_cfg: list) -> bool:
+        label = self._process_lock_label(workers_cfg)
+        digest = hashlib.sha256(label.encode("utf-8")).hexdigest()[:16]
+        lock_path = os.path.join(get_config_dir(), f"mqtt_worker_{digest}.lock")
+        lock = _MqttProcessLock(lock_path, label)
+        if not lock.acquire():
+            emit("ERROR", f"MQTT worker start blocked: subscription set already owned [{label}] (lock={lock_path}, pid={os.getpid()})")
+            return False
+        self._process_lock = lock
+        emit("INFO", f"MQTT process lock acquired: [{label}] lock={lock_path} pid={os.getpid()}")
+        return True
+
+    def _release_process_lock(self) -> None:
+        if self._process_lock:
+            label = self._process_lock.label
+            self._process_lock.release()
+            self._process_lock = None
+            emit("INFO", f"MQTT process lock released: [{label}] pid={os.getpid()}")
+
+    @staticmethod
+    def _correlation_dedup_window(cfg: dict) -> float:
+        try:
+            window = float((cfg or {}).get("correlation_dedup_window", DEFAULT_DEDUP_WINDOW) or DEFAULT_DEDUP_WINDOW)
+        except (TypeError, ValueError):
+            window = float(DEFAULT_DEDUP_WINDOW)
+        return max(1.0, window)
+
+    @staticmethod
+    def _seconds_text(seconds: float) -> str:
+        return f"{seconds:g}s"
+
     # ---- 生命周期 ----
     def initialize(self) -> None:
+        if self._coordinator:
+            emit("WARNING", f"MQTT worker already initialized; skip duplicate initialize pid={os.getpid()}")
+            return
         # 恢复 operate 持久化状态（manual 接管等），重启后继续生效
         loaded = self._load_operate_cache()
         if loaded:
@@ -192,9 +319,16 @@ class MqttWorkerExtension:
             self._initialized = True
             return
 
-        self._identities = [WorkerIdentity(w) for w in workers_cfg]
+        self._release_process_lock()
+        if not self._acquire_process_lock(workers_cfg):
+            self._initialized = True
+            return
+
+        dedup_window = self._correlation_dedup_window(cfg)
+        self._identities = [WorkerIdentity(w, dedup_window=dedup_window) for w in workers_cfg]
         emit("INFO", f"初始化 MQTT 数字员工 共 {len(self._identities)} 个身份，"
               f"启用 {sum(1 for i in self._identities if i.enabled)} 个")
+        emit("INFO", f"correlationId 去重窗口={self._seconds_text(dedup_window)}（同 id 在窗口内忽略，过期后可重新处理）")
         self._validate_multi_identity()
 
         first = next((i for i in self._identities if i.enabled),
@@ -236,23 +370,65 @@ class MqttWorkerExtension:
         return self._coordinator._ui_lock if self._coordinator else None
 
     def _enter_ui(self) -> None:
-        """获取 UI 锁，标记进入 UI 操作（供异步媒体线程等使用）。"""
+        """获取 UI 锁，标记进入 UI 操作（供异步媒体线程等使用）。
+
+        记录 acquire 时的锁 epoch 到线程局部变量，_exit_ui 校验未变化才执行副作用。
+        """
+        self._ui_tls.acquired = False
+        self._ui_tls.lock = None
         if self._coordinator:
-            if not self._coordinator._ui_lock.acquire(timeout=30):
-                emit("WARNING", "UI 锁获取超时 (30s)，媒体保存跳过")
+            # 先快照锁引用再 acquire：确保记录的就是自己 acquire 的那把对象
+            lock = self._coordinator._ui_lock
+            if not lock.acquire(timeout=60):
+                emit("WARNING", "UI 锁获取超时 (60s)，媒体保存跳过")
                 raise RuntimeError("UI lock acquire timeout")
+            self._ui_tls.lock = lock
+            self._ui_tls.acquired = True
             self._coordinator._wx_busy_event.set()
             input_blocker.set_bot_active(True)  # 放行机器人点击
 
     def _exit_ui(self) -> None:
-        """释放 UI 锁，标记退出 UI 操作。"""
+        """释放 UI 锁，标记退出 UI 操作。
+
+        若我持有的锁已非当前活动锁（被重建过），跳过副作用避免污染新任务。
+        用锁对象身份比较，免疫 acquire/记录之间的重建竞态。
+        """
+        if not getattr(self._ui_tls, 'acquired', False):
+            return
+        held_lock = getattr(self._ui_tls, 'lock', None)
+        cur_lock = self._coordinator._ui_lock if self._coordinator else None
+        if held_lock is not None and held_lock is not cur_lock:
+            emit("WARNING",
+                 "_exit_ui: 我持有的锁已非当前活动锁（已被重建），"
+                 "跳过副作用避免污染新任务")
+            self._ui_tls.acquired = False
+            # 只释放自己 acquire 的那把（废弃的旧锁），绝不碰当前 coordinator._ui_lock（新锁）
+            try:
+                held_lock.release()
+            except RuntimeError:
+                pass
+            self._ui_tls.lock = None
+            return
         input_blocker.set_bot_active(False)
         if self._coordinator:
             self._coordinator._wx_busy_event.clear()
+        if held_lock is not None:
             try:
-                self._coordinator._ui_lock.release()
+                held_lock.release()
             except RuntimeError:
                 pass
+        self._ui_tls.lock = None
+        self._ui_tls.acquired = False
+
+    def shutdown(self) -> None:
+        if self._coordinator:
+            self._coordinator.shutdown()
+            self._release_process_lock()
+        self._coordinator = None
+        self._adapter = None
+        self._executor = None
+        self._identities = []
+        self._release_process_lock()
 
     def reconfigure(self) -> None:
         self._refresh_wx_account_info()
@@ -261,6 +437,8 @@ class MqttWorkerExtension:
         if not cfg.get("enabled"):
             if self._coordinator:
                 self._coordinator.shutdown()
+                self._release_process_lock()
+            self._release_process_lock()
             self._coordinator = None
             self._adapter = None
             self._executor = None
@@ -272,6 +450,8 @@ class MqttWorkerExtension:
         if not workers_cfg:
             if self._coordinator:
                 self._coordinator.shutdown()
+                self._release_process_lock()
+            self._release_process_lock()
             self._coordinator = None
             self._adapter = None
             self._executor = None
@@ -280,7 +460,20 @@ class MqttWorkerExtension:
             return
         if self._coordinator:
             self._coordinator.shutdown()
-        self._identities = [WorkerIdentity(w) for w in workers_cfg]
+            self._release_process_lock()
+        self._release_process_lock()
+        if not self._acquire_process_lock(workers_cfg):
+            self._release_process_lock()
+            self._coordinator = None
+            self._adapter = None
+            self._executor = None
+            self._identities = []
+            self._initialized = True
+            return
+
+        dedup_window = self._correlation_dedup_window(cfg)
+        self._identities = [WorkerIdentity(w, dedup_window=dedup_window) for w in workers_cfg]
+        emit("INFO", f"correlationId 去重窗口={self._seconds_text(dedup_window)}（同 id 在窗口内忽略，过期后可重新处理）")
         first = next((i for i in self._identities if i.enabled),
                      self._identities[0] if self._identities else None)
         agent_base = first.agent_id if first else "wbot"
@@ -443,8 +636,7 @@ class MqttWorkerExtension:
             return False
 
         # 防回环
-        last = self._last_sent.get(chat)
-        if last and last[0] == content and time.time() - last[1] < 30:
+        if self.is_recent_sent(chat, content):
             emit("INFO", f"跳过回环消息(刚由 bot 发出): {chat} -> {content[:50]}")
             return False
 
@@ -501,12 +693,101 @@ class MqttWorkerExtension:
                     emit("INFO", f"未匹配转发联系人，已发送 Webhook 提醒: {chat}")
                 except Exception as e:
                     emit("WARNING", f"Webhook 通知失败: {e}")
-        if forwarded and self._executor:
-            try:
-                self._executor.record_forwarded(chat)  # 记录转发 sender,供 send_text 串线兜底告警
-            except Exception:
-                pass
         return forwarded
+
+    def _mark_contact_unreachable_alert(self, chat: str, kind: str) -> bool:
+        """Return True when an unreachable-contact alert should be emitted."""
+        now = time.time()
+        key = (chat, kind)
+        with self._alert_lock:
+            expired = [k for k, ts in self._contact_unreachable_alerts.items()
+                       if now - ts > self._contact_unreachable_alert_ttl]
+            for k in expired:
+                self._contact_unreachable_alerts.pop(k, None)
+            last = self._contact_unreachable_alerts.get(key)
+            if last and now - last <= self._contact_unreachable_alert_ttl:
+                return False
+            self._contact_unreachable_alerts[key] = now
+            return True
+
+    def notify_contact_unreachable(self, chat: str, kind: str, message: str = "",
+                                   source: str = "", correlation_id: str = "") -> bool:
+        """Unified alert for deleted/blocked friends: Feishu + MQTT system event."""
+        chat = (chat or "").strip() or "未知目标"
+        kind = (kind or "").strip()
+        if kind not in ("deleted", "blocked"):
+            emit("WARNING", f"unknown contact unreachable kind: chat={chat} kind={kind}")
+            return False
+        if not self._mark_contact_unreachable_alert(chat, kind):
+            emit("INFO", f"skip duplicate contact unreachable alert: {chat} kind={kind} source={source}")
+            return False
+
+        label = "被删除" if kind == "deleted" else "被拉黑"
+        nickname = self._wx_nickname or "未知"
+        try:
+            from .. import webhook_send
+            webhook_send.send_webhook(
+                title=f"【{label}】{nickname} → {chat}",
+                content=(f"目标: {chat}\n类型: {label}\n来源: {source or 'unknown'}\n"
+                         f"消息: {(message or '')[:200]}\n"
+                         f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            )
+        except Exception as e:
+            emit("WARNING", f"contact unreachable Feishu alert failed: {e}")
+
+        return self.on_contact_unreachable(
+            chat=chat, kind=kind, message=message,
+            source=source, correlation_id=correlation_id)
+
+    def on_contact_unreachable(self, chat: str, kind: str, message: str = "",
+                               source: str = "", correlation_id: str = "") -> bool:
+        """Publish MQTT system event for a deleted/blocked friend."""
+        if not self._initialized or not self._adapter:
+            return False
+        if not self._wx_nickname:
+            try:
+                emit("INFO", "refresh wx account info for contact unreachable alert")
+                self._refresh_wx_account_info()
+            except Exception as e:
+                emit("WARNING", f"refresh wx account info failed for contact unreachable alert: {e}")
+
+        label = "被删除" if kind == "deleted" else "被拉黑"
+        msg_id = correlation_id or f"unreachable-{uuid.uuid4().hex[:8]}"
+        event_text = f"[系统] 好友{label}，消息无法送达"
+        published = False
+        for ident in self._identities:
+            if not ident.enabled:
+                continue
+            forward_topic = ident.resolve_forward_topic()
+            if not forward_topic:
+                continue
+            callback_prefix = ident.resolve_callback_prefix()
+            publish_topic = f"{forward_topic}/{msg_id}" if callback_prefix and forward_topic == callback_prefix else forward_topic
+            payload = {
+                "event": "wechat_contact_unreachable",
+                "correlationId": msg_id,
+                "senderId": chat,
+                "senderName": chat,
+                "chatId": chat,
+                "targetId": chat,
+                "targetName": chat,
+                "text": event_text,
+                "chat": chat,
+                "type": kind,
+                "wechatErrorType": kind,
+                "source": source or "unknown",
+                "messagePreview": (message or "")[:200],
+                "agentId": ident.agent_id,
+                "role": ident.role,
+                "selfWxName": self._wx_nickname,
+                "selfWxId": self._wx_id,
+                "ts": int(time.time() * 1000),
+            }
+            payload_str = json.dumps(payload, ensure_ascii=False)
+            ok = self._adapter.publish_safe(publish_topic, payload_str)
+            emit("INFO", f"contact unreachable notice -> {publish_topic} role={ident.role} {'ok' if ok else 'failed'} payload={payload_str}", ident.role)
+            published = ok or published
+        return published
 
     def on_friend_accepted(self, nickname: str, remark: str = "", tags: list | None = None) -> None:
         if not self._initialized or not self._adapter:
@@ -659,7 +940,7 @@ class MqttWorkerExtension:
                 emit("INFO", f"补发媒体消息 -> {publish_topic} file={file_name}", ident.role)
 
     def _save_latest_media(self, chat: str, msg_type: str) -> tuple[str, int, str] | None:
-        """右键图片消息（left+40 偏移点缩略图）→ 复制 → 剪贴板落地 → 上传 MinIO。"""
+        """右键图片消息（靠左偏移点缩略图）→ 复制 → 剪贴板落地 → 上传 MinIO。"""
         import tempfile
         import pyautogui
         from pyweixin.WeChatTools import Navigator, mouse
@@ -681,8 +962,9 @@ class MqttWorkerExtension:
                 return None
             last = items[-1]
             r = last.rectangle()
-            # 右键坐标偏移到组件最左侧+200（点中图片缩略图，避免小图片点空）
-            mouse.right_click(coords=(r.left + 200, (r.top + r.bottom) // 2))
+            # 右键坐标从原 left+200 向左偏移 1/2，窄图缩略图更容易被选中。
+            media_click_x = r.left + 100
+            mouse.right_click(coords=(media_click_x, (r.top + r.bottom) // 2))
             time.sleep(0.5)
             copy_item = mw.child_window(**MenuItems.CopyMenuItem)
             copied = False
